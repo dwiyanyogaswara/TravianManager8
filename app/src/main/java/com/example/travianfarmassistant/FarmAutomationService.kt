@@ -60,6 +60,11 @@ class FarmAutomationService : Service() {
             instanceRef?.get()?.handleLoginResultFromVisibleWebView(result)
         }
 
+        fun forwardVillageListResult(result: String) {
+            android.util.Log.d("TravianFarmAssistant", "[DEBUG] ENTER forwardVillageListResult")
+            instanceRef?.get()?.handleVillageListResult(result)
+        }
+
         fun onVisibleWebViewDetached() {
             android.util.Log.d("TravianFarmAssistant", "[DEBUG] ENTER onVisibleWebViewDetached")
             instanceRef?.get()?.onVisibleWebViewDetachedInternal()
@@ -107,9 +112,30 @@ class FarmAutomationService : Service() {
     private var minMinutes = 1L
     private var maxMinutes = 1L
     private var nextAt = 0L
+    private var farmListCycleStartedAt = 0L
+    private var resourceBuilderCycleStartedAt = 0L
     private val cycleWatchdogRunnable = Runnable {
         if (!running) return@Runnable
         logEvent("WATCHDOG: fase siklus berjalan >5 menit — proses aktif diakhiri agar scheduler tidak stuck")
+        val watchdogNow = System.currentTimeMillis()
+        if (farmListCycleStartedAt > 0L) {
+            val duration = (watchdogNow - farmListCycleStartedAt).coerceAtLeast(0L)
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putLong("farm_list_cycle_duration_ms", duration)
+                .putLong("farm_list_cycle_started_at", 0L)
+                .apply()
+            logEvent("Farm List: waktu proses ${formatDuration(duration)} (watchdog)")
+            farmListCycleStartedAt = 0L
+        }
+        if (resourceBuilderCycleStartedAt > 0L) {
+            val duration = (watchdogNow - resourceBuilderCycleStartedAt).coerceAtLeast(0L)
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putLong("resource_builder_cycle_duration_ms", duration)
+                .putLong("resource_builder_cycle_started_at", 0L)
+                .apply()
+            logEvent("Resource Builder: waktu proses ${formatDuration(duration)} (watchdog)")
+            resourceBuilderCycleStartedAt = 0L
+        }
         pendingStartAll = false
         builderInProgress = false
         loginInProgress = false
@@ -358,10 +384,15 @@ class FarmAutomationService : Service() {
         if (!running) return
         val now = timeFormat.format(Date())
         cycleNumber += 1
+        val cycleStartMs = System.currentTimeMillis()
+        farmListCycleStartedAt = if (farmListEnabled) cycleStartMs else 0L
+        resourceBuilderCycleStartedAt = 0L
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putString("last_run", now)
             .putInt("current_cycle_number", cycleNumber)
             .putBoolean("cycle_active", true)
+            .putLong("farm_list_cycle_started_at", farmListCycleStartedAt)
+            .putLong("resource_builder_cycle_started_at", 0L)
             .apply()
         logEvent("Siklus dimulai pada $now")
         handler.removeCallbacks(cycleWatchdogRunnable)
@@ -809,6 +840,23 @@ class FarmAutomationService : Service() {
     private fun startResourceBuilderCycle() {
         debugTrace("ENTER startResourceBuilderCycle")
         if (!running) return
+
+        val nowMs = System.currentTimeMillis()
+        if (farmListCycleStartedAt > 0L) {
+            val farmDuration = (nowMs - farmListCycleStartedAt).coerceAtLeast(0L)
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putLong("farm_list_cycle_duration_ms", farmDuration)
+                .putLong("farm_list_cycle_started_at", 0L)
+                .apply()
+            logEvent("Farm List: waktu proses ${formatDuration(farmDuration)}")
+            farmListCycleStartedAt = 0L
+        }
+
+        resourceBuilderCycleStartedAt = nowMs
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putLong("resource_builder_cycle_started_at", resourceBuilderCycleStartedAt)
+            .apply()
+
         builderInProgress = true
         builderVillages.clear()
         builderVillageIndex = 0
@@ -1257,12 +1305,21 @@ class FarmAutomationService : Service() {
 
     private fun finishResourceBuilderCycle() {
         debugTrace("ENTER finishResourceBuilderCycle")
+        val nowMs = System.currentTimeMillis()
+        if (resourceBuilderCycleStartedAt > 0L) {
+            val builderDuration = (nowMs - resourceBuilderCycleStartedAt).coerceAtLeast(0L)
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putLong("resource_builder_cycle_duration_ms", builderDuration)
+                .putLong("resource_builder_cycle_started_at", 0L)
+                .apply()
+            logEvent("Resource Builder: waktu proses ${formatDuration(builderDuration)}")
+            resourceBuilderCycleStartedAt = 0L
+        }
         builderInProgress = false
         builderVillages.clear()
         builderVillageIndex = 0
         logEvent("Resource Builder: siklus selesai")
         scheduleNextRandomRun()
-        updateNotification("Menunggu siklus berikutnya — ${timeFormat.format(Date(nextAt))}")
     }
 
     private fun discoverVillagesForBuilder() {
@@ -1482,7 +1539,9 @@ class FarmAutomationService : Service() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("cycle_active", false).apply()
         handler.removeCallbacks(nextRunRunnable)
         handler.postDelayed(nextRunRunnable, delay)
-        logEvent("Interval berikutnya dipilih acak: $chosenMinutes menit")
+        val nextText = "Next Run ${timeFormat.format(Date(nextAt))} — dalam ${chosenMinutes} menit"
+        updateNotification(nextText)
+        logEvent("Interval berikutnya dipilih acak: $chosenMinutes menit; $nextText")
     }
 
     private val nextRunRunnable = Runnable {
@@ -1624,6 +1683,14 @@ class FarmAutomationService : Service() {
         logEvent("Background service dihentikan")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
+    }
+
+    private fun formatDuration(durationMs: Long): String {
+        val totalSeconds = (durationMs / 1000L).coerceAtLeast(0L)
+        val hours = totalSeconds / 3600L
+        val minutes = (totalSeconds % 3600L) / 60L
+        val seconds = totalSeconds % 60L
+        return String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
     }
 
     private fun updateNotification(text: String) {

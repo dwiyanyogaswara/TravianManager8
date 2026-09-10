@@ -38,6 +38,8 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var lastRun: TextView
     private lateinit var nextRun: TextView
+    private lateinit var farmListCycleTime: TextView
+    private lateinit var resourceBuilderCycleTime: TextView
     private lateinit var serverInput: EditText
     private lateinit var usernameInput: EditText
     private lateinit var passwordInput: EditText
@@ -170,6 +172,8 @@ class MainActivity : Activity() {
         status = findViewById(R.id.status)
         lastRun = findViewById(R.id.lastRun)
         nextRun = findViewById(R.id.nextRun)
+        farmListCycleTime = findViewById(R.id.farmListCycleTime)
+        resourceBuilderCycleTime = findViewById(R.id.resourceBuilderCycleTime)
         webView = findViewById(R.id.webView)
         pruneLogs()
         handler.postDelayed(logCleanup, 60 * 60 * 1000L)
@@ -1943,6 +1947,15 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun onVillageListResult(result: String) {
+            debugTrace("ENTER onVillageListResult")
+            if (FarmAutomationService.isRunningFromService()) {
+                FarmAutomationService.forwardVillageListResult(result)
+                return
+            }
+        }
+
+        @JavascriptInterface
         fun onLiveClickResult(result: String) {
             debugTrace("ENTER onLiveClickResult")
             runOnUiThread { handleLiveClickResult(result) }
@@ -2099,7 +2112,7 @@ class MainActivity : Activity() {
     private fun refreshRecentLogs() {
         if (!::recentLogs.isInitialized || isFinishing) return
         logIoExecutor.execute {
-            val lines = readLastLogLines(3, 32768)
+            val lines = readLastLogLines(5, 32768)
             handler.post {
                 if (isFinishing || !::recentLogs.isInitialized) return@post
                 try {
@@ -2343,6 +2356,14 @@ class MainActivity : Activity() {
         return out
     }
 
+    private fun formatDuration(durationMs: Long): String {
+        val totalSeconds = (durationMs / 1000L).coerceAtLeast(0L)
+        val hours = totalSeconds / 3600L
+        val minutes = (totalSeconds % 3600L) / 60L
+        val seconds = totalSeconds % 60L
+        return String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
+    }
+
     private fun updateCountdown() {
         debugTrace("ENTER updateCountdown")
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
@@ -2350,6 +2371,17 @@ class MainActivity : Activity() {
         val next = prefs.getLong("next_run_at", 0L)
         val last = prefs.getString("last_run", "").orEmpty()
         lastRun.text = if (last.isBlank()) "Last run: --" else "Last run: $last"
+
+        val farmStart = prefs.getLong("farm_list_cycle_started_at", 0L)
+        val farmSaved = prefs.getLong("farm_list_cycle_duration_ms", 0L)
+        val builderStart = prefs.getLong("resource_builder_cycle_started_at", 0L)
+        val builderSaved = prefs.getLong("resource_builder_cycle_duration_ms", 0L)
+        val nowMs = System.currentTimeMillis()
+        val farmDuration = if (farmStart > 0L) (nowMs - farmStart).coerceAtLeast(0L) else farmSaved
+        val builderDuration = if (builderStart > 0L) (nowMs - builderStart).coerceAtLeast(0L) else builderSaved
+        farmListCycleTime.text = "Waktu Siklus Farm List: ${formatDuration(farmDuration)}"
+        resourceBuilderCycleTime.text = "Waktu Siklus Resource Builder: ${formatDuration(builderDuration)}"
+
         if (!serviceRunning) {
             nextRun.text = "Next run: --"
             return
