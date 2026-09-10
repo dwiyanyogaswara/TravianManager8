@@ -2280,9 +2280,12 @@ class MainActivity : Activity() {
             layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
         val right = TextView(this).apply {
-            text = if (production >= 0) "${if (production >= 0) "+" else ""}$production/jam" else "--/jam"
+            text = if (production >= 0) "+$production/jam" else "--/jam"
             textSize = 13f
-            setTextColor(Color.LTGRAY)
+            setTextColor(if (production < 0) Color.RED else Color.LTGRAY)
+            if (production < 0) {
+                setTypeface(null, android.graphics.Typeface.BOLD)
+            }
             gravity = android.view.Gravity.END
             layoutParams = LinearLayout.LayoutParams(-2, -2)
         }
