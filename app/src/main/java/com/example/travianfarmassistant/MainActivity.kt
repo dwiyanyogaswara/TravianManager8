@@ -30,6 +30,7 @@ import org.json.JSONArray
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
     private lateinit var webView: WebView
@@ -67,6 +68,12 @@ class MainActivity : Activity() {
             }
         }
     }
+    // Semua pembacaan file log dilakukan di thread background agar pindah tab
+    // tidak memblokir UI/WebView.
+    private val logIoExecutor = Executors.newSingleThreadExecutor()
+    private var logOverviewRequestId = 0L
+    private var recentLogRefreshScheduled = false
+
     private lateinit var farmTab: View
     private lateinit var capacityTab: View
     private lateinit var logTab: View
@@ -1796,6 +1803,7 @@ class MainActivity : Activity() {
         // membuat rekursi tak berujung dan menyebabkan ANR saat tab Log dibuka.
         if (quiet !in setOf(
                 "updateCountdown",
+                "run",
                 "refreshRecentLogs",
                 "pruneLogs",
                 "refreshLogOverview",
@@ -1818,9 +1826,10 @@ class MainActivity : Activity() {
                 handler.post { pruneLogs() }
             }
 
-            // Preview 3 log terakhir ringan dan tetap diperbarui. Tab LOG penuh
-            // hanya dirender ketika user benar-benar membukanya.
-            refreshRecentLogs()
+            // Jangan membaca file log synchronously untuk setiap baris debug.
+            // Dengan verbose logging, ini sebelumnya membuat main thread sibuk terus
+            // dan tab dapat terlihat seperti crash/ANR.
+            scheduleRecentLogRefresh()
         } catch (_: Exception) {
             // Logging must never interrupt the automation.
         }
@@ -2060,45 +2069,52 @@ class MainActivity : Activity() {
         super.onPause()
     }
 
-    private fun refreshRecentLogs() {
-        debugTrace("ENTER refreshRecentLogs")
-        if (!::recentLogs.isInitialized) return
-        try {
-            val file = getFileStreamPath(logFileName)
-            if (!file.exists()) {
-                recentLogs.text = "Belum ada log."
-                return
-            }
-            val lines = readLastLogLines(3, 32768)
-            if (lines.isEmpty()) {
-                recentLogs.text = "Belum ada log."
-                return
-            }
+    private fun scheduleRecentLogRefresh() {
+        if (!::recentLogs.isInitialized || isFinishing || recentLogRefreshScheduled) return
+        recentLogRefreshScheduled = true
+        handler.postDelayed({
+            recentLogRefreshScheduled = false
+            if (!isFinishing) refreshRecentLogs()
+        }, 250L)
+    }
 
-            val palette = intArrayOf(
-                Color.rgb(255, 214, 64),
-                Color.rgb(100, 181, 246),
-                Color.rgb(129, 199, 132),
-                Color.rgb(186, 104, 200),
-                Color.rgb(255, 167, 38),
-                Color.rgb(77, 208, 225)
-            )
-            val spannable = SpannableString(lines.joinToString("\n"))
-            var offset = 0
-            lines.forEach { line ->
-                val cycle = Regex("\\[CYCLE (\\d+)\\]").find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()
-                val color = if (cycle != null) palette[(cycle - 1).mod(palette.size)] else Color.LTGRAY
-                spannable.setSpan(
-                    android.text.style.ForegroundColorSpan(color),
-                    offset,
-                    offset + line.length,
-                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
-                )
-                offset += line.length + 1
+    private fun refreshRecentLogs() {
+        if (!::recentLogs.isInitialized || isFinishing) return
+        logIoExecutor.execute {
+            val lines = readLastLogLines(3, 32768)
+            handler.post {
+                if (isFinishing || !::recentLogs.isInitialized) return@post
+                try {
+                    if (lines.isEmpty()) {
+                        recentLogs.text = "Belum ada log."
+                        return@post
+                    }
+                    val palette = intArrayOf(
+                        Color.rgb(255, 214, 64),
+                        Color.rgb(100, 181, 246),
+                        Color.rgb(129, 199, 132),
+                        Color.rgb(186, 104, 200),
+                        Color.rgb(255, 167, 38),
+                        Color.rgb(77, 208, 225)
+                    )
+                    val spannable = SpannableString(lines.joinToString("\n"))
+                    var offset = 0
+                    lines.forEach { line ->
+                        val cycle = Regex("\\[CYCLE (\\d+)\\]").find(line)?.groupValues?.getOrNull(1)?.toIntOrNull()
+                        val color = if (cycle != null) palette[(cycle - 1).mod(palette.size)] else Color.LTGRAY
+                        spannable.setSpan(
+                            android.text.style.ForegroundColorSpan(color),
+                            offset,
+                            offset + line.length,
+                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                        )
+                        offset += line.length + 1
+                    }
+                    recentLogs.text = spannable
+                } catch (_: Exception) {
+                    // Preview must never interrupt automation.
+                }
             }
-            recentLogs.text = spannable
-        } catch (_: Exception) {
-            // Recent log preview must never interrupt the automation.
         }
     }
 
@@ -2145,14 +2161,27 @@ class MainActivity : Activity() {
     }
 
     private fun setupTabs() {
-        debugTrace("ENTER setupTabs")
+        // Jangan melakukan pembacaan/parsing log berat langsung di callback klik tab.
+        // Visibility diubah dulu, lalu konten dirender setelah UI punya kesempatan
+        // menggambar frame berikutnya. Pembacaan file Log sendiri dilakukan async.
         fun showTab(tab: View) {
-            debugTrace("ENTER showTab")
+            android.util.Log.d("TravianFarmAssistant", "TAB -> ${when (tab) {
+                farmTab -> "FARM"
+                capacityTab -> "CAPACITY"
+                logTab -> "LOG"
+                else -> "UNKNOWN"
+            }}")
+
             farmTab.visibility = if (tab === farmTab) View.VISIBLE else View.GONE
             capacityTab.visibility = if (tab === capacityTab) View.VISIBLE else View.GONE
             logTab.visibility = if (tab === logTab) View.VISIBLE else View.GONE
-            if (tab === capacityTab) renderCapacityOverview()
-            if (tab === logTab) refreshLogOverview()
+
+            handler.post {
+                when {
+                    tab === capacityTab -> renderCapacityOverview()
+                    tab === logTab -> refreshLogOverview()
+                }
+            }
         }
         farmTabButton.setOnClickListener { showTab(farmTab) }
         capacityTabButton.setOnClickListener { showTab(capacityTab) }
@@ -2225,30 +2254,24 @@ class MainActivity : Activity() {
     }
 
     private fun refreshLogOverview() {
-        debugTrace("ENTER refreshLogOverview")
-        try {
-            val file = getFileStreamPath(logFileName)
-            if (!file.exists()) {
-                logOverview.text = "Belum ada log."
-                return
-            }
+        if (!::logOverview.isInitialized || isFinishing) return
+        val requestId = ++logOverviewRequestId
+        logOverview.text = "Memuat log..."
 
-            // Batasi jumlah baris yang dirender agar tab Log tetap ringan walaupun
-            // verbose debug sudah berjalan lama. Log file tetap utuh di storage.
-            val maxLines = 300
-            val lines = readLastLogLines(maxLines, 262144)
-            if (lines.isEmpty()) {
-                logOverview.text = "Belum ada log."
-            } else {
-                logOverview.text = buildColoredLog(lines.asReversed())
+        logIoExecutor.execute {
+            val lines = readLastLogLines(120, 131072)
+            handler.post {
+                if (isFinishing || requestId != logOverviewRequestId || logTab.visibility != View.VISIBLE) return@post
+                logOverview.text = if (lines.isEmpty()) {
+                    "Belum ada log."
+                } else {
+                    buildColoredLog(lines.asReversed())
+                }
             }
-        } catch (_: Exception) {
-            logOverview.text = "Log belum dapat dibaca."
         }
     }
 
     private fun buildColoredLog(lines: List<String>): CharSequence {
-        debugTrace("ENTER buildColoredLog")
         val palette = intArrayOf(
             Color.rgb(245, 166, 35),   // kuning/amber
             Color.rgb(30, 100, 210),   // biru
@@ -2318,6 +2341,7 @@ class MainActivity : Activity() {
         FarmAutomationService.onVisibleWebViewDetached()
         handler.removeCallbacks(countdownUpdater)
         logEvent("MainActivity ditutup; background service tetap dapat berjalan")
+        logIoExecutor.shutdownNow()
         super.onDestroy()
     }
 }
