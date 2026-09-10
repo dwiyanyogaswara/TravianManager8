@@ -250,11 +250,6 @@ class MainActivity : Activity() {
             startAutomaticLogin()
         }
 
-        findViewById<Button>(R.id.openFarm).setOnClickListener {
-            logEvent("Tombol BUKA FARM LIST ditekan")
-            openFarmList()
-        }
-
         val serviceRunning = getSharedPreferences("config", MODE_PRIVATE)
             .getBoolean("service_running", false)
         running = serviceRunning
@@ -270,9 +265,9 @@ class MainActivity : Activity() {
      * Login sekarang benar-benar otomatis:
      * 1. Ambil username/password dari form.
      * 2. Buka server.
-     * 3. Jika session masih aktif -> langsung Farm List.
+     * 3. Jika session masih aktif -> langsung mulai refresh/scan village.
      * 4. Jika belum login -> cari form login dan submit dari WebView.
-     * 5. Setelah redirect sukses -> otomatis membuka Farm List.
+     * 5. Setelah login/redirect sukses -> otomatis refresh/scan seluruh village.
      *
      * Password hanya disimpan di RAM selama aplikasi hidup dan tidak ditulis
      * ke SharedPreferences. Ini memungkinkan auto re-login ketika session
@@ -1665,7 +1660,16 @@ class MainActivity : Activity() {
     private fun debugTrace(message: String) {
         android.util.Log.d("TravianFarmAssistant", "[DEBUG] $message")
         val quiet = message.removePrefix("ENTER ").substringBefore("(")
-        if (quiet !in setOf("updateCountdown", "refreshRecentLogs", "pruneLogs")) {
+        // Helper UI/log ini dapat dipanggil dari logEvent(). Jangan persist debugTrace
+        // mereka, karena refreshLogOverview() -> debugTrace() -> logEvent() akan
+        // membuat rekursi tak berujung dan menyebabkan ANR saat tab Log dibuka.
+        if (quiet !in setOf(
+                "updateCountdown",
+                "refreshRecentLogs",
+                "pruneLogs",
+                "refreshLogOverview",
+                "buildColoredLog"
+            )) {
             logEvent("[DEBUG] $message")
         }
     }
@@ -2060,7 +2064,17 @@ class MainActivity : Activity() {
         debugTrace("ENTER refreshLogOverview")
         try {
             val file = getFileStreamPath(logFileName)
-            val lines = if (file.exists()) file.readLines() else emptyList()
+            if (!file.exists()) {
+                logOverview.text = "Belum ada log."
+                return
+            }
+
+            // Batasi jumlah baris yang dirender agar tab Log tetap ringan walaupun
+            // verbose debug sudah berjalan lama. Log file tetap utuh di storage.
+            val maxLines = 1200
+            val lines = file.useLines { sequence ->
+                sequence.filter { it.isNotBlank() }.toList().takeLast(maxLines)
+            }
             if (lines.isEmpty()) {
                 logOverview.text = "Belum ada log."
             } else {
