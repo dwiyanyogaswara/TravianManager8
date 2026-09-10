@@ -112,6 +112,23 @@ class FarmAutomationService : Service() {
     private var minMinutes = 1L
     private var maxMinutes = 1L
     private var nextAt = 0L
+    private val delayedVillageRefreshRunnable = Runnable {
+        if (!running) return@Runnable
+        if (pendingStartAll || builderInProgress || loginInProgress || reloginRequested) {
+            // Jangan mengganggu Farm List / Resource Builder yang sedang memakai WebView.
+            // Coba lagi setelah fase aktif selesai.
+            logEvent("AUTO REFRESH VILLAGE: WebView sedang dipakai; refresh ditunda 10 detik")
+            handler.postDelayed(delayedVillageRefreshRunnable, 10_000L)
+            return@Runnable
+        }
+        val requested = MainActivity.requestVillageRefreshFromService()
+        if (requested) {
+            logEvent("AUTO REFRESH VILLAGE: dijalankan 1 menit setelah Next Run")
+        } else {
+            logEvent("AUTO REFRESH VILLAGE: MainActivity belum aktif; refresh akan dicoba lagi 10 detik")
+            handler.postDelayed(delayedVillageRefreshRunnable, 10_000L)
+        }
+    }
     private val cycleWatchdogRunnable = Runnable {
         if (!running) return@Runnable
         val now = System.currentTimeMillis()
@@ -398,9 +415,11 @@ class FarmAutomationService : Service() {
             .apply()
         logEvent("Siklus dimulai pada $now")
         handler.removeCallbacks(cycleWatchdogRunnable)
+        handler.removeCallbacks(delayedVillageRefreshRunnable)
         // Farm List + verifikasi dapat membutuhkan >60 detik untuk banyak village.
         // Watchdog 5 menit mencegah false timeout sebelum Resource Builder sempat jalan.
         handler.postDelayed(cycleWatchdogRunnable, 5 * 60_000L)
+        handler.postDelayed(delayedVillageRefreshRunnable, 60_000L)
         if (farmListEnabled) {
             triggerStartAllFarmLists()
         } else if (resourceBuilderEnabled) {
@@ -923,9 +942,39 @@ class FarmAutomationService : Service() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putLong("resource_cycle_started_at", now)
             .apply()
-        builderStage = "DISCOVER"
+        // JANGAN discover/scan ulang village di sini. Daftar village + link village
+        // sudah disimpan saat REFRESH VILLAGE dan selection sudah menjadi snapshot
+        // ketika BOT dinyalakan. Discovery ulang sebelumnya menyebabkan builder
+        // menunggu retry berkali-kali (bahkan sampai 10x) karena sidebar tidak selalu
+        // merender semua village.
+        builderVillages = loadBuilderVillagesFromSnapshot()
+        if (builderVillages.isEmpty()) {
+            logEvent("Resource Builder: tidak ada village terpilih dari snapshot; siklus dilewati")
+            finishResourceBuilderCycle()
+            return
+        }
+
+        val missingTargets = builderVillages.filter { builderResourceLinks[it.first].isNullOrBlank() }
+        if (missingTargets.isNotEmpty()) {
+            logEvent(
+                "Resource Builder: target resource belum tersimpan untuk " +
+                    missingTargets.joinToString(" | ") { "${it.second} [${it.first}]" } +
+                    "; village tersebut dilewati"
+            )
+            builderVillages = builderVillages.filter { builderResourceLinks[it.first].orEmpty().isNotBlank() }.toMutableList()
+        }
+
+        if (builderVillages.isEmpty()) {
+            finishResourceBuilderCycle()
+            return
+        }
+
+        builderStage = "LOAD_DORF"
         updateNotification("Farm Assistant — Resource Builder menyiapkan village")
-        logEvent("Resource Builder: mulai siklus semua village")
+        logEvent(
+            "Resource Builder: ${builderVillages.size} village siap; " +
+                "menggunakan link village + target resource yang sudah tersimpan"
+        )
         // Reset watchdog saat masuk fase Builder agar timeout Farm List tidak
         // mematikan Builder yang memang membutuhkan waktu lebih dari 1 menit.
         handler.removeCallbacks(cycleWatchdogRunnable)
@@ -1043,42 +1092,70 @@ class FarmAutomationService : Service() {
         debugTrace("ENTER clickBuilderVillageFromDorf")
         if (!running || !builderInProgress || !builderVillageClickInProgress) return
         val village = builderVillages.getOrNull(builderVillageIndex) ?: return
+        val savedVillageHref = builderVillageLinks[village.first].orEmpty().trim()
         val idJson = JSONObject.quote(village.first)
         val nameJson = JSONObject.quote(village.second)
+        val hrefJson = JSONObject.quote(savedVillageHref)
         val js = """
             (() => {
                 const id = $idJson;
                 const name = $nameJson;
+                const savedHref = $hrefJson;
                 const clean = s => String(s || '').replace(/\s+/g,' ').trim();
-                const anchors = [...document.querySelectorAll('a')];
+                const sameHref = (a, b) => {
+                    if (!a || !b || b === '#') return false;
+                    const absA = new URL(a, location.href).href.split('#')[0];
+                    const absB = new URL(b, location.href).href.split('#')[0];
+                    return absA === absB;
+                };
+                const anchors = [...document.querySelectorAll('a[href], [data-did]')];
                 let anchor = null;
-                for (const a of anchors) {
-                    const entry = a.closest('.listEntry, .dropContainer, li');
-                    const dataDid = a.getAttribute('data-did') || entry?.getAttribute('data-did') || '';
-                    const href = a.getAttribute('href') || '';
-                    const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
-                    if ((dataDid === id || hrefDid === id) && !/build\.php/i.test(href)) { anchor = a; break; }
+
+                // Prioritas 1: link village yang memang sudah disimpan saat scan.
+                if (savedHref && savedHref !== '#') {
+                    anchor = anchors.find(a => {
+                        const h = a.getAttribute('href') || '';
+                        return sameHref(h, savedHref);
+                    }) || null;
                 }
-                if (!anchor) return 'not-found';
-                anchor.scrollIntoView({block:'center', inline:'nearest'});
-                anchor.click();
-                // Beberapa skin memakai href="#" dan navigasi dilakukan oleh
-                // handler Travian. Jika handler gagal, fallback ke URL village.
-                setTimeout(() => {
-                    const current = location.href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
-                    if (current !== id) location.href = '/dorf1.php?newdid=' + encodeURIComponent(id);
-                }, 2200);
-                return 'clicked';
+
+                // Prioritas 2: data-did / newdid dari village yang sama.
+                if (!anchor) {
+                    anchor = anchors.find(a => {
+                        const entry = a.closest('.listEntry, .dropContainer, li');
+                        const dataDid = a.getAttribute('data-did') || entry?.getAttribute('data-did') || '';
+                        const href = a.getAttribute('href') || '';
+                        const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                        return dataDid === id || hrefDid === id;
+                    }) || null;
+                }
+
+                if (anchor) {
+                    anchor.scrollIntoView({block:'center', inline:'nearest'});
+                    anchor.click();
+                    return 'clicked';
+                }
+
+                // Last resort: jika Travian tidak merender anchor village tetapi
+                // snapshot memiliki href village yang valid, buka link tersimpan.
+                if (savedHref && savedHref !== '#' && /newdid=\d+/i.test(savedHref)) {
+                    location.href = new URL(savedHref, location.href).href;
+                    return 'loaded_saved_village';
+                }
+                return 'not-found';
             })();
         """.trimIndent()
         automationWebView()?.evaluateJavascript(js) { raw ->
             val result = raw.orEmpty().trim('"')
-            if (result == "clicked") {
+            if (result == "clicked" || result == "loaded_saved_village") {
                 builderStage = "WAIT_VILLAGE"
-                logEvent("Resource Builder: klik village ${village.second} (ID ${village.first}) dari dorf1.php")
-            } else if (builderAttempt < 5) {
+                logEvent(
+                    "Resource Builder: ${if (result == "clicked") "klik" else "buka link tersimpan"} " +
+                        "village ${village.second} (ID ${village.first}) dari dorf1.php"
+                )
+            } else if (builderAttempt < 3) {
                 builderAttempt++
-                handler.postDelayed({ clickBuilderVillageFromDorf() }, 700)
+                handler.postDelayed({ clickBuilderVillageFromDorf() }, 350)
             } else {
                 logEvent("Resource Builder: link village ${village.second} (ID ${village.first}) tidak ditemukan di dorf1.php")
                 builderVillageClickInProgress = false
@@ -1578,6 +1655,32 @@ class FarmAutomationService : Service() {
         updateNotification("Next Run ${timeFormat.format(Date(nextAt))} | dalam ${formatDuration((nextAt - System.currentTimeMillis()).coerceAtLeast(0L))}")
     }
 
+    private fun loadBuilderVillagesFromSnapshot(): MutableList<Pair<String, String>> {
+        debugTrace("ENTER loadBuilderVillagesFromSnapshot")
+        val array = runCatching { org.json.JSONArray(selectedBuilderVillagesJson) }.getOrNull()
+            ?: return mutableListOf()
+        val out = mutableListOf<Pair<String, String>>()
+        val seen = mutableSetOf<String>()
+        for (i in 0 until array.length()) {
+            val item = array.optJSONObject(i) ?: continue
+            val id = item.optString("id").trim()
+            val name = item.optString("name").trim().ifBlank { "Village $id" }
+            if (id.isBlank() || !selectedBuilderVillageIds.contains(id) || !seen.add(id)) continue
+            out.add(id to name)
+        }
+        // Jika selection tidak dikonfigurasi, gunakan semua village yang tersimpan
+        // pada snapshot. Tidak ada discovery ulang dari sidebar.
+        if (!builderSelectionConfigured && out.isEmpty()) {
+            for (i in 0 until array.length()) {
+                val item = array.optJSONObject(i) ?: continue
+                val id = item.optString("id").trim()
+                val name = item.optString("name").trim().ifBlank { "Village $id" }
+                if (id.isNotBlank() && seen.add(id)) out.add(id to name)
+            }
+        }
+        return out
+    }
+
     private fun loadSavedBuilderVillageLinks() {
         debugTrace("ENTER loadSavedBuilderVillageLinks")
         builderVillageLinks.clear()
@@ -2013,6 +2116,7 @@ class FarmAutomationService : Service() {
         persistActiveCycleDuration()
         running = false
         handler.removeCallbacks(cycleWatchdogRunnable)
+        handler.removeCallbacks(delayedVillageRefreshRunnable)
         pendingStartAll = false
         handler.removeCallbacksAndMessages(null)
         if (webView != null) {
