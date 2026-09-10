@@ -13,6 +13,13 @@ import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.util.Base64
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
+import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.spec.GCMParameterSpec
+import java.security.KeyStore
 import android.widget.*
 import android.graphics.Color
 import android.text.SpannableString
@@ -105,6 +112,9 @@ class MainActivity : Activity() {
     private val logTimeFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault())
     private val logFileName = "farm_assistant.log"
     private val logMaxAgeMs = 12 * 60 * 60 * 1000L
+    private var lastLogPruneAt = 0L
+    private val passwordKeyStore = "AndroidKeyStore"
+    private val passwordKeyAlias = "TravianFarmAssistantPassword"
     private val logCleanup = object : Runnable {
         override fun run() {
             debugTrace("ENTER run")
@@ -164,6 +174,7 @@ class MainActivity : Activity() {
         logEvent("Aplikasi v4.14 dimulai")
         serverInput.setText(prefs.getString("server", "https://ts20.x2.europe.travian.com"))
         usernameInput.setText(prefs.getString("username", ""))
+        passwordInput.setText(decryptSavedPassword(prefs.getString("password_secure", "").orEmpty()))
 
         minIntervalInput = findViewById(R.id.intervalMin)
         maxIntervalInput = findViewById(R.id.intervalMax)
@@ -771,10 +782,39 @@ class MainActivity : Activity() {
                     }
                 } catch (_) {}
 
-                // Ikuti persis cara Live Click Logger menemukan village:
-                // cari anchor yang bisa diklik, lalu ambil data-did dari anchor
-                // atau ancestor .listEntry/.dropContainer/li. Pada halaman ini
-                // anchor village dapat berupa href="#", jadi href bukan sumber ID utama.
+                // Travian Legends biasanya menyimpan SEMUA village di:
+                // #sidebarBoxVillagelist > div.content > div.villageList > div.dropContainer
+                // lalu ID ada di .listEntry[data-did]. Jangan bergantung pada href karena
+                // beberapa anchor village memakai href="#".
+                const directEntries = root
+                    ? [...root.querySelectorAll('div.content div.villageList div.dropContainer')]
+                    : [];
+                for (const container of directEntries) {
+                    const entry = container.querySelector('.listEntry') || container;
+                    const anchor = entry.querySelector('a');
+                    const dataDid = entry.getAttribute('data-did') ||
+                        container.getAttribute('data-did') ||
+                        anchor?.getAttribute('data-did') || '';
+                    const href = anchor?.getAttribute('href') || '';
+                    const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                    const id = /^\d+$/.test(dataDid) ? dataDid : hrefDid;
+                    if (!/^\d+$/.test(id) || seen.has(id)) continue;
+                    let name = clean(
+                        entry.querySelector('.name')?.textContent ||
+                        anchor?.getAttribute('title') ||
+                        anchor?.getAttribute('aria-label') ||
+                        entry.textContent || ''
+                    );
+                    name = name.replace(/\(\s*[−-]?\d+\s*\|\s*[−-]?\d+\s*\)/g, '').trim();
+                    if (!name) name = 'Village ' + id;
+                    seen.add(id);
+                    out.push({ id, name, href, tag:anchor?.tagName || entry.tagName || '',
+                        idAttr:anchor?.id || entry.id || '',
+                        className:clean(entry.className || '').slice(0,100),
+                        matchSource:'sidebar-dropContainer' });
+                }
+
+                // Fallback untuk layout/tema Travian yang berbeda atau DOM yang berubah.
                 const candidates = [...document.querySelectorAll(
                     'a, [data-did], [role="button"], .listEntry, .dropContainer, li'
                 )];
@@ -786,35 +826,19 @@ class MainActivity : Activity() {
                     const dataDid = anchor.getAttribute('data-did') ||
                         entry?.getAttribute('data-did') || '';
                     const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
-
-                    // build.php?newdid=... terbukti muncul sebagai link lain di
-                    // halaman. Itu bukan target village sidebar dan harus dibuang.
                     if (/^\s*\/?build\.php(?:[?&]|$)/i.test(href)) continue;
-
                     const id = /^\d+$/.test(dataDid) ? dataDid : hrefDid;
                     if (!/^\d+$/.test(id) || seen.has(id)) continue;
-
                     let name = clean(
                         entry?.querySelector('.name')?.textContent ||
-                        anchor.querySelector?.('.name')?.textContent ||
-                        entry?.querySelector?.('.name')?.textContent ||
-                        anchor.getAttribute('title') ||
-                        anchor.getAttribute('aria-label') ||
+                        anchor.getAttribute('title') || anchor.getAttribute('aria-label') ||
                         anchor.textContent || ''
                     );
                     name = name.replace(/\(\s*[−-]?\d+\s*\|\s*[−-]?\d+\s*\)/g, '').trim();
                     if (!name) name = 'Village ' + id;
-
                     seen.add(id);
-                    out.push({
-                        id,
-                        name,
-                        href,
-                        tag: anchor.tagName || '',
-                        idAttr: anchor.id || '',
-                        className: clean(anchor.className || '').slice(0,100),
-                        matchSource: dataDid ? 'data-did' : 'href'
-                    });
+                    out.push({id, name, href, tag:anchor.tagName || '', idAttr:anchor.id || '',
+                        className:clean(anchor.className || '').slice(0,100), matchSource:dataDid ? 'data-did' : 'href'});
                 }
 
                 const bodyText = clean(document.body?.innerText || '');
@@ -998,6 +1022,18 @@ class MainActivity : Activity() {
                             kind:'AUTO_VILLAGE_CLICK_SENT', id, name, href,
                             matchSource, pageUrl:location.href
                         }));
+                        // Beberapa entry terakhir (termasuk village baru) terlihat di DOM
+                        // tetapi handler kliknya tidak selalu aktif. Verifikasi setelah 2,2 detik;
+                        // bila URL/active village masih bukan target, pakai URL dorf1 langsung.
+                        setTimeout(() => {
+                            const current = location.href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                            const active = document.querySelector(
+                                '#sidebarBoxVillagelist .listEntry.active, .villageList .listEntry.active'
+                            )?.getAttribute('data-did') || '';
+                            if (current !== id && active !== id) {
+                                location.href = '/dorf1.php?newdid=' + encodeURIComponent(id);
+                            }
+                        }, 2200);
                         return true;
                     } catch (e) {
                         AndroidFarm.onLiveClickResult(JSON.stringify({
@@ -1104,53 +1140,71 @@ class MainActivity : Activity() {
                 const levels = fields.filter(n => Number.isFinite(n));
                 const uniqueLevels = levels.slice(0, 18);
 
-                // RESOURCE BAR: Travian resource IDs memakai urutan lama l4=wood,
-                // l3=clay, l2=iron, l1=crop. Ambil current/capacity dari text ID,
-                // atribut, parent, dan object resources/maxStorage bila tersedia.
-                const scriptText = [...document.scripts].map(s => s.textContent || '').join('\n');
-                const maxStorage = {};
-                const storage = {};
-                for (const rid of ['l1','l2','l3','l4']) {
-                    const maxRe = new RegExp('maxStorage\\s*[:=]\\s*\\{[\\s\\S]*?\\b' + rid + '\\s*[:=]\\s*(\\d+)', 'i');
-                    const maxMatch = scriptText.match(maxRe);
-                    if (maxMatch) maxStorage[rid] = parseInt(maxMatch[1],10);
-                    const storageRe = new RegExp('storage\\s*[:=]\\s*\\{[\\s\\S]*?\\b' + rid + '\\s*[:=]\\s*(\\d+)', 'i');
-                    const sm = scriptText.match(storageRe);
-                    if (sm) storage[rid] = parseInt(sm[1],10);
-                }
-
+                // RESOURCE BAR: Travian Legends memakai l1=wood, l2=clay,
+                // l3=iron, l4=crop. Sumber paling stabil adalah object window.resources
+                // yang dipakai UI Travian sendiri; fallback membaca #stockBar.
+                const resourcesObject = (typeof window.resources === 'object' && window.resources) ? window.resources : null;
+                const storage = resourcesObject?.storage || {};
+                const maxStorage = resourcesObject?.maxStorage || {};
                 const resources = {};
+
+                const numberFromText = value => {
+                    const m = String(value || '').replace(/\u00a0/g,' ').match(/-?\d[\d\s.,]*/);
+                    return m ? parseInt(m[0].replace(/[^0-9-]/g,''), 10) : NaN;
+                };
+
+                const readResource = rid => {
+                    const el = document.getElementById(rid);
+                    const direct = storage[rid];
+                    const directMax = maxStorage[rid];
+                    let current = Number.isFinite(Number(direct)) ? Number(direct) : NaN;
+                    let capacity = Number.isFinite(Number(directMax)) ? Number(directMax) : NaN;
+
+                    if (el) {
+                        const source = [
+                            el.textContent || '',
+                            el.getAttribute('title') || '',
+                            el.getAttribute('data-value') || '',
+                            el.getAttribute('data-current') || '',
+                            el.getAttribute('data-max') || '',
+                            el.getAttribute('data-capacity') || '',
+                            el.parentElement?.textContent || ''
+                        ].join(' ');
+                        const pair = source.match(/(-?\d[\d\s.,]*)\s*\/\s*(\d[\d\s.,]*)/);
+                        if (!Number.isFinite(current)) current = pair ? numberFromText(pair[1]) : numberFromText(source);
+                        if (!Number.isFinite(capacity)) capacity = pair ? numberFromText(pair[2]) : NaN;
+                    }
+
+                    // Current Travian UI also exposes warehouse/granary capacity in #stockBar.
+                    if (!Number.isFinite(capacity)) {
+                        const isCrop = rid === 'l4';
+                        const capNode = document.querySelector(
+                            isCrop ? '#stockBar > div.granary > div > div' : '#stockBar > div.warehouse > div > div'
+                        );
+                        capacity = numberFromText(capNode?.textContent || '');
+                    }
+                    return {
+                        text: el?.textContent || '',
+                        current: Number.isFinite(current) ? String(Math.trunc(current)) : '',
+                        capacity: Number.isFinite(capacity) ? String(Math.trunc(capacity)) : ''
+                    };
+                };
+
                 let resourceComplete = true;
                 for (const rid of ['l1','l2','l3','l4']) {
-                    const el = document.getElementById(rid);
-                    if (!el) { resourceComplete = false; continue; }
-                    const text = clean(el.textContent || '');
-                    const attrs = [
-                        el.getAttribute('data-current') || '',
-                        el.getAttribute('data-value') || '',
-                        el.getAttribute('data-max') || '',
-                        el.getAttribute('data-capacity') || '',
-                        el.getAttribute('title') || ''
-                    ].join(' ');
-                    const parentText = clean((el.parentElement && el.parentElement.textContent) || '');
-                    const source = [text, attrs, parentText].join(' ');
-                    const pair = source.match(/(-?\d[\d\s.,]*)\s*\/\s*(\d[\d\s.,]*)/);
-                    let current = pair ? pair[1].replace(/[^0-9-]/g,'') : '';
-                    let capacity = pair ? pair[2].replace(/[^0-9-]/g,'') : '';
-                    if (!current && storage[rid] != null) current = String(storage[rid]);
-                    if (!capacity && maxStorage[rid] != null) capacity = String(maxStorage[rid]);
-                    resources[rid] = {text, current, capacity};
-                    if (!current || !capacity) resourceComplete = false;
+                    resources[rid] = readResource(rid);
+                    if (!resources[rid].current || !resources[rid].capacity) resourceComplete = false;
                 }
 
-                // Jangan simpan hasil setengah matang. Tunggu sampai 4 resource dan
-                // resource field sudah benar-benar dirender.
-                if (!container || uniqueLevels.length < 18 || !resourceComplete) {
+                // Level village dan snapshot resource dipisahkan: jangan membuang village
+                // hanya karena resource bar terlambat dirender. Nama + level tetap diterima
+                // jika 18 field sudah tersedia; resource akan disimpan bila lengkap.
+                if (!container || uniqueLevels.length < 18) {
                     AndroidFarm.onVillageScanResult(JSON.stringify({
-                        notReady:true, reason:'DOM_DATA_INCOMPLETE', id:currentId, expectedId,
+                        notReady:true, reason:'FIELDS_NOT_READY', id:currentId, expectedId,
                         url, activeId, activeName, fieldCount:uniqueLevels.length,
-                        resourceComplete, resourceContainer:!!container,
-                        resources, debugFields:debugFields.slice(0,12)
+                        resourceComplete, resourceContainer:!!container, resources,
+                        debugFields:debugFields.slice(0,12)
                     }));
                     return;
                 }
@@ -1251,11 +1305,11 @@ class MainActivity : Activity() {
             val capacity = item.optString("capacity", "").replace(".", "").replace(",", "").toIntOrNull() ?: -1
             return current to capacity
         }
-        // Travian resource bar: l4=wood, l3=clay, l2=iron, l1=crop.
-        val wood = pair("l4")
-        val clay = pair("l3")
-        val iron = pair("l2")
-        val crop = pair("l1")
+        // Travian Legends: l1=wood, l2=clay, l3=iron, l4=crop.
+        val wood = pair("l1")
+        val clay = pair("l2")
+        val iron = pair("l3")
+        val crop = pair("l4")
         resourceSnapshots[id] = ResourceSnapshot(
             villageId = id, villageName = name,
             wood = wood.first, woodCap = wood.second,
@@ -1265,6 +1319,9 @@ class MainActivity : Activity() {
             updatedAt = timeFormat.format(Date())
         )
         saveResourceSnapshots()
+        if (wood.first < 0 || clay.first < 0 || iron.first < 0 || crop.first < 0) {
+            logEvent("UI: [$progress] resource belum lengkap — wood=$wood; clay=$clay; iron=$iron; crop=$crop")
+        }
         if (capacityTab.visibility == View.VISIBLE) renderCapacityOverview()
 
         val existing = villageScanResults.indexOfFirst { it.first == id }
@@ -1298,14 +1355,20 @@ class MainActivity : Activity() {
         debugTrace("ENTER finishVillageScan")
         villageScanActive = false
 
-        val unique = villageScanResults.distinctBy { it.first }
-        farmStatus.text = "${unique.size} village selesai dicek dan siap dipilih."
+        // Semua target tetap masuk ke checklist. Jika pembacaan detail satu village
+        // gagal, namanya tetap ditampilkan dan level akan memakai data lama bila ada.
+        val resultById = villageScanResults.toMap()
+        val merged = villageScanTargets.map { (id, targetName) ->
+            id to (resultById[id] ?: targetName)
+        }.distinctBy { it.first }
+        val processedCount = villageScanResults.distinctBy { it.first }.size
+        farmStatus.text = "${merged.size} village ditemukan; detail berhasil ${processedCount}/${merged.size}."
         logEvent(
-            "UI: scan selesai — ${unique.size}/${villageScanTargets.size} village " +
-                "berhasil diproses"
+            "UI: scan selesai — ${processedCount}/${merged.size} detail berhasil; " +
+                "${merged.size} village tetap ditampilkan"
         )
 
-        renderVillageChecklist(unique)
+        renderVillageChecklist(merged)
         villageScanTargets.clear()
     }
 
@@ -1653,6 +1716,69 @@ class MainActivity : Activity() {
         nextRun.text = "Next run: --"
     }
 
+    private fun saveCredentialsSecure() {
+        debugTrace("ENTER saveCredentialsSecure")
+        if (pendingUsername.isBlank() || pendingPassword.isBlank()) return
+        val encrypted = encryptPasswordSecure(pendingPassword)
+        if (encrypted.isBlank()) {
+            logEvent("Login berhasil tetapi password aman gagal disimpan")
+            return
+        }
+        getSharedPreferences("config", MODE_PRIVATE).edit()
+            .putString("username", pendingUsername)
+            .putString("password_secure", encrypted)
+            .apply()
+    }
+
+    private fun encryptPasswordSecure(value: String): String {
+        if (value.isEmpty()) return ""
+        return try {
+            val keyStore = KeyStore.getInstance(passwordKeyStore).apply { load(null) }
+            val key = if (keyStore.containsAlias(passwordKeyAlias)) {
+                keyStore.getKey(passwordKeyAlias, null) as javax.crypto.SecretKey
+            } else {
+                val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, passwordKeyStore)
+                generator.init(
+                    KeyGenParameterSpec.Builder(
+                        passwordKeyAlias,
+                        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+                    )
+                        .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                        .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                        .setKeySize(256)
+                        .build()
+                )
+                generator.generateKey()
+            }
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            val packed = cipher.iv + cipher.doFinal(value.toByteArray(Charsets.UTF_8))
+            Base64.encodeToString(packed, Base64.NO_WRAP)
+        } catch (e: Exception) {
+            android.util.Log.e("TravianFarmAssistant", "Gagal menyimpan password aman", e)
+            ""
+        }
+    }
+
+    private fun decryptSavedPassword(encoded: String): String {
+        if (encoded.isBlank()) return ""
+        return try {
+            val keyStore = KeyStore.getInstance(passwordKeyStore).apply { load(null) }
+            if (!keyStore.containsAlias(passwordKeyAlias)) return ""
+            val key = keyStore.getKey(passwordKeyAlias, null) as javax.crypto.SecretKey
+            val packed = Base64.decode(encoded, Base64.DEFAULT)
+            if (packed.size <= 12) return ""
+            val iv = packed.copyOfRange(0, 12)
+            val encrypted = packed.copyOfRange(12, packed.size)
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(128, iv))
+            String(cipher.doFinal(encrypted), Charsets.UTF_8)
+        } catch (e: Exception) {
+            android.util.Log.w("TravianFarmAssistant", "Password tersimpan tidak dapat dibaca", e)
+            ""
+        }
+    }
+
     private fun normalizeServer(value: String): String {
         debugTrace("ENTER normalizeServer")
         var s = value.trim()
@@ -1682,16 +1808,46 @@ class MainActivity : Activity() {
     private fun logEvent(message: String) {
         val line = "${logTimeFormat.format(Date())} | $message"
         try {
-            openFileOutput(logFileName, MODE_APPEND).bufferedWriter().use {
-                it.appendLine(line)
+            openFileOutput(logFileName, MODE_APPEND).bufferedWriter().use { it.appendLine(line) }
+
+            // Jangan prune/read seluruh file pada setiap log. Dengan verbose debug hal ini
+            // membuat UI macet dan tab LOG dapat ANR. Cleanup cukup berkala.
+            val now = System.currentTimeMillis()
+            if (now - lastLogPruneAt >= 60 * 60 * 1000L) {
+                lastLogPruneAt = now
+                handler.post { pruneLogs() }
             }
-            pruneLogs()
+
+            // Preview 3 log terakhir ringan dan tetap diperbarui. Tab LOG penuh
+            // hanya dirender ketika user benar-benar membukanya.
             refreshRecentLogs()
-            if (::logOverview.isInitialized && logTab.visibility == View.VISIBLE) {
-                refreshLogOverview()
-            }
         } catch (_: Exception) {
             // Logging must never interrupt the automation.
+        }
+    }
+
+    private fun readLastLogLines(maxLines: Int, maxBytes: Int = 262144): List<String> {
+        val file = getFileStreamPath(logFileName)
+        if (!file.exists() || file.length() <= 0L) return emptyList()
+        return try {
+            java.io.RandomAccessFile(file, "r").use { raf ->
+                val length = raf.length()
+                val start = maxOf(0L, length - maxBytes.toLong())
+                raf.seek(start)
+                if (start > 0) raf.readLine() // buang partial line
+                val out = ArrayList<String>(maxLines)
+                while (true) {
+                    val raw = raf.readLine() ?: break
+                    if (raw.isNotBlank()) {
+                        val decoded = String(raw.toByteArray(Charsets.ISO_8859_1), Charsets.UTF_8)
+                        out.add(decoded)
+                        if (out.size > maxLines) out.removeAt(0)
+                    }
+                }
+                out
+            }
+        } catch (_: Exception) {
+            emptyList()
         }
     }
 
@@ -1740,9 +1896,10 @@ class MainActivity : Activity() {
                         loginInProgress = false
                         reloginRequested = false
                         loginRetryCount = 0
-                        farmStatus.text = "Login berhasil. Refresh village otomatis..."
-                        logEvent("Login berhasil/session aktif — otomatis menjalankan refresh village")
-                        handler.postDelayed({ refreshVillagesForUi() }, 300)
+                        saveCredentialsSecure()
+                        farmStatus.text = "Login berhasil. User/password tersimpan. Mengambil data village..."
+                        logEvent("Login berhasil/session aktif — user + password tersimpan aman; otomatis menjalankan refresh village")
+                        handler.postDelayed({ refreshVillagesForUi() }, 350)
                     }
                     "no_username_field", "no_form" -> {
                         if (loginRetryCount < 20 && (running || reloginRequested)) {
@@ -1912,7 +2069,7 @@ class MainActivity : Activity() {
                 recentLogs.text = "Belum ada log."
                 return
             }
-            val lines = file.readLines().filter { it.isNotBlank() }.takeLast(3)
+            val lines = readLastLogLines(3, 32768)
             if (lines.isEmpty()) {
                 recentLogs.text = "Belum ada log."
                 return
@@ -2078,10 +2235,8 @@ class MainActivity : Activity() {
 
             // Batasi jumlah baris yang dirender agar tab Log tetap ringan walaupun
             // verbose debug sudah berjalan lama. Log file tetap utuh di storage.
-            val maxLines = 1200
-            val lines = file.useLines { sequence ->
-                sequence.filter { it.isNotBlank() }.toList().takeLast(maxLines)
-            }
+            val maxLines = 300
+            val lines = readLastLogLines(maxLines, 262144)
             if (lines.isEmpty()) {
                 logOverview.text = "Belum ada log."
             } else {
