@@ -112,7 +112,7 @@ class FarmAutomationService : Service() {
     private var minMinutes = 1L
     private var maxMinutes = 1L
     private var nextAt = 0L
-    private val delayedVillageRefreshRunnable = Runnable {
+    private val delayedVillageRefreshRunnable: Runnable = Runnable {
         if (!running) return@Runnable
         if (pendingStartAll || builderInProgress || loginInProgress || reloginRequested) {
             // Jangan mengganggu Farm List / Resource Builder yang sedang memakai WebView.
