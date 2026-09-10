@@ -868,6 +868,9 @@ class FarmAutomationService : Service() {
         builderAttempt = 0
         pendingBuilderResourceHref = ""
         builderVillageClickInProgress = false
+        // Selection dikunci di UI selama BOT aktif. Karena itu snapshot yang diterima
+        // saat ACTION_START harus dipakai apa adanya sampai BOT dimatikan. Jangan
+        // membaca ulang selection dari SharedPreferences di tengah siklus.
         loadSavedBuilderResourceTargets()
         val now = System.currentTimeMillis()
         if (farmListCycleStartedAt > 0L) {
@@ -895,6 +898,10 @@ class FarmAutomationService : Service() {
     private fun processResourceBuilderVillage() {
         debugTrace("ENTER processResourceBuilderVillage")
         if (!running || !builderInProgress) return
+
+        // Selection sudah menjadi snapshot sejak BOT diaktifkan dan tidak boleh
+        // berubah di tengah siklus. Daftar builderVillage dibuat dari snapshot itu.
+
         if (builderVillageIndex >= builderVillages.size) {
             finishResourceBuilderCycle()
             return

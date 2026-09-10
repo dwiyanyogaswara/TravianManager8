@@ -292,6 +292,7 @@ class MainActivity : Activity() {
         botToggle.isChecked = serviceRunning
         updateBotToggleVisual(serviceRunning)
         botToggle.setOnCheckedChangeListener(this@MainActivity::handleBotToggle)
+        setSelectionControlsEnabled(!serviceRunning)
 
         createNotificationChannel()
     }
@@ -376,6 +377,9 @@ class MainActivity : Activity() {
         pendingPassword = pass
         running = true
         updateBotToggleVisual(true)
+        // Selection dikunci selama BOT aktif. Snapshot selection yang dikirim ke
+        // service adalah satu-satunya konfigurasi yang dipakai sampai BOT dimatikan.
+        setSelectionControlsEnabled(false)
         farmStatus.text = "Background automation sedang dimulai..."
         logEvent("Memulai background automation. Range=${minMinutes}-${maxMinutes} menit; Farm List=${if (farmListEnabled) "ON" else "OFF"}; Resource Builder=${if (resourceBuilderEnabled) "ON" else "OFF"}")
 
@@ -398,6 +402,28 @@ class MainActivity : Activity() {
             startService(intent)
         }
         return true
+    }
+
+    /**
+     * Kunci semua kontrol yang menentukan selection automation ketika BOT aktif.
+     * User harus mematikan BOT terlebih dahulu sebelum mengubah checklist village
+     * atau mode Farm List/Resource Builder.
+     */
+    private fun setSelectionControlsEnabled(enabled: Boolean) {
+        debugTrace("ENTER setSelectionControlsEnabled")
+        if (::villageChecklist.isInitialized) {
+            for (i in 0 until villageChecklist.childCount) {
+                villageChecklist.getChildAt(i)?.isEnabled = enabled
+            }
+        }
+        findViewById<CheckBox>(R.id.farmListEnabled)?.isEnabled = enabled
+        findViewById<CheckBox>(R.id.resourceBuilder)?.isEnabled = enabled
+        findViewById<Button>(R.id.refreshVillages)?.isEnabled = enabled
+
+        logEvent(
+            "UI: selection ${if (enabled) "TERBUKA" else "DIKUNCI"} — " +
+                "village checklist, Farm List, Resource Builder, dan Refresh Village"
+        )
     }
 
     private fun startAutomaticLogin() {
@@ -784,6 +810,10 @@ class MainActivity : Activity() {
 
     private fun refreshVillagesForUi() {
         debugTrace("ENTER refreshVillagesForUi")
+        if (running || FarmAutomationService.isRunningFromService()) {
+            logEvent("UI: REFRESH VILLAGE ditolak karena BOT masih aktif; matikan BOT untuk mengubah selection")
+            return
+        }
         villageScanActive = true
         villageScanTargets.clear()
         villageScanResults.clear()
@@ -1823,8 +1853,9 @@ class MainActivity : Activity() {
         }
         startService(intent)
         updateBotToggleVisual(false)
+        setSelectionControlsEnabled(true)
         status.text = "Status: STOPPED"
-        logEvent("Status STOPPED")
+        logEvent("Status STOPPED — selection kembali dapat diedit")
         nextRun.text = "Next run: --"
     }
 
@@ -2160,6 +2191,7 @@ class MainActivity : Activity() {
             updateBotToggleVisual(serviceRunning)
             botToggle.setOnCheckedChangeListener(this@MainActivity::handleBotToggle)
         }
+        setSelectionControlsEnabled(!serviceRunning)
         if (serviceRunning) {
             status.text = "Status: RUNNING — BACKGROUND"
             updateCountdown()
