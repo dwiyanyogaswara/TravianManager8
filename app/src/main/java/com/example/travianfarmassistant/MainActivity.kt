@@ -83,6 +83,10 @@ class MainActivity : Activity() {
     private var villageScanExpected = 0
     private var villageScanRetry = 0
     private var villageScanPageRetry = 0
+    private var villageScanDataRetry = 0
+    private var villageScanScrollPass = 0
+    private val villageScanCollectedTargets = linkedMapOf<String, String>()
+    private var villageScanCollectInFlight = false
 
     private val handler = Handler(Looper.getMainLooper())
     private var running = false
@@ -219,14 +223,17 @@ class MainActivity : Activity() {
                 // LOAD VILLAGE memiliki prioritas atas scheduler/service agar WebView
                 // benar-benar dipakai untuk scan village satu per satu.
                 if (villageScanActive) {
+                    // Satu onPageFinished bisa terpanggil beberapa kali (redirect/hash/consent).
+                    // Jangan menembakkan evaluateJavascript scan berulang secara bersamaan.
                     handler.postDelayed({
+                        if (!villageScanActive) return@postDelayed
                         val target = villageScanTargets.getOrNull(villageScanIndex)
                         if (target != null) {
-                            collectCurrentVillageData()
+                            if (!villageScanCollectInFlight) collectCurrentVillageData()
                         } else {
                             collectVillageTargetsFromSidebar()
                         }
-                    }, 450)
+                    }, 900)
                     return
                 }
 
@@ -721,6 +728,10 @@ class MainActivity : Activity() {
         villageScanExpected = 0
         villageScanRetry = 0
         villageScanPageRetry = 0
+        villageScanDataRetry = 0
+        villageScanScrollPass = 0
+        villageScanCollectedTargets.clear()
+        villageScanCollectInFlight = false
 
         farmStatus.text = "Refresh village: membaca daftar village..."
         logEvent("UI: REFRESH VILLAGE → membuka dorf1.php")
@@ -738,14 +749,39 @@ class MainActivity : Activity() {
                 const out = [];
                 const seen = new Set();
                 const root = document.querySelector('#sidebarBoxVillagelist');
+                const scrollPass = $villageScanScrollPass;
+
+                // Beberapa halaman Travian merender list village secara lazy/virtual.
+                // Geser container daftar ke beberapa posisi; hasil tiap pass digabung
+                // di Kotlin sehingga village yang belum ada di DOM pada pass pertama
+                // tetap akan ditemukan pada pass berikutnya.
+                try {
+                    const candidates = [];
+                    if (root) candidates.push(root);
+                    if (root) candidates.push(...root.querySelectorAll('*'));
+                    const scrollable = candidates.find(el =>
+                        el && el.scrollHeight > el.clientHeight + 8 &&
+                        getComputedStyle(el).overflowY !== 'hidden'
+                    );
+                    if (scrollable) {
+                        const max = Math.max(0, scrollable.scrollHeight - scrollable.clientHeight);
+                        const positions = [0, 0.5, 1, 0.25, 0.75, 0];
+                        const ratio = positions[scrollPass % positions.length];
+                        scrollable.scrollTop = Math.round(max * ratio);
+                    }
+                } catch (_) {}
 
                 // Ikuti persis cara Live Click Logger menemukan village:
                 // cari anchor yang bisa diklik, lalu ambil data-did dari anchor
                 // atau ancestor .listEntry/.dropContainer/li. Pada halaman ini
                 // anchor village dapat berupa href="#", jadi href bukan sumber ID utama.
-                const anchors = [...document.querySelectorAll('a')];
-                for (const anchor of anchors) {
-                    const entry = anchor.closest('.listEntry, .dropContainer, li');
+                const candidates = [...document.querySelectorAll(
+                    'a, [data-did], [role="button"], .listEntry, .dropContainer, li'
+                )];
+                for (const anchor of candidates) {
+                    const entry = anchor.matches('.listEntry, .dropContainer, li')
+                        ? anchor
+                        : anchor.closest('.listEntry, .dropContainer, li');
                     const href = anchor.getAttribute('href') || '';
                     const dataDid = anchor.getAttribute('data-did') ||
                         entry?.getAttribute('data-did') || '';
@@ -761,6 +797,7 @@ class MainActivity : Activity() {
                     let name = clean(
                         entry?.querySelector('.name')?.textContent ||
                         anchor.querySelector?.('.name')?.textContent ||
+                        entry?.querySelector?.('.name')?.textContent ||
                         anchor.getAttribute('title') ||
                         anchor.getAttribute('aria-label') ||
                         anchor.textContent || ''
@@ -788,8 +825,9 @@ class MainActivity : Activity() {
                     villages: out,
                     expected,
                     rootFound: !!root,
-                    anchorCount: anchors.length,
+                    anchorCount: candidates.length,
                     villageCount: out.length,
+                    scrollPass,
                     globalNewdidLinks: document.querySelectorAll('a[href*="newdid="]').length,
                     globalDataDid: document.querySelectorAll('[data-did]').length,
                     url: location.href
@@ -807,7 +845,6 @@ class MainActivity : Activity() {
         val json = runCatching { JSONObject(rawJson) }.getOrNull()
         val targets = mutableListOf<Pair<String, String>>()
         val array = json?.optJSONArray("villages")
-
         if (array != null) {
             for (i in 0 until array.length()) {
                 val item = array.optJSONObject(i) ?: continue
@@ -817,41 +854,48 @@ class MainActivity : Activity() {
             }
         }
 
-        val unique = targets.distinctBy { it.first }
-        villageScanExpected = json?.optInt("expected", unique.size) ?: unique.size
+        val expected = json?.optInt("expected", 0) ?: 0
+        if (expected > 0) villageScanExpected = maxOf(villageScanExpected, expected)
 
-        // Debug penting: simpan daftar ID + nama + href yang benar-benar terbaca
-        // sebelum scanner mulai berpindah village. Ini membantu membandingkan
-        // dengan hasil klik manual di Live WebView.
-        if (unique.isNotEmpty()) {
-            val details = targets.distinctBy { it.first }.joinToString(" | ") { (id, name) ->
-                "$name(ID=$id)"
-            }
+        // Jangan mengganti hasil scan setiap retry. Beberapa layout Travian merender
+        // daftar village secara virtual/lazy; setiap scroll bisa hanya menampilkan
+        // sebagian item. Semua bagian digabung sampai jumlahnya lengkap.
+        for ((id, name) in targets) {
+            if (id.isNotBlank()) villageScanCollectedTargets[id] = name
+        }
+
+        val discovered = villageScanCollectedTargets.entries.map { it.key to it.value }
+        val details = discovered.joinToString(" | ") { (id, name) -> "$name(ID=$id)" }
+        if (discovered.isNotEmpty()) {
             logEvent(
-                "UI: TARGET DEBUG: ${unique.size}/${villageScanExpected}; $details"
+                "UI: TARGET DEBUG: ${discovered.size}/${villageScanExpected}; " +
+                    "pass=$villageScanScrollPass; $details"
             )
         }
 
-        // Jangan matikan scanner hanya karena sidebar belum selesai dirender.
-        // WebView onPageFinished bisa terpanggil sebelum villageList tersedia.
-        if (json?.optBoolean("notReady", false) == true || unique.isEmpty()) {
+        val complete = villageScanExpected <= 0 || discovered.size >= villageScanExpected
+        if (!complete && villageScanScrollPass < 12) {
+            villageScanRetry++
+            villageScanScrollPass++
+            val rootFound = json?.optBoolean("rootFound", false) == true
+            val anchorCount = json?.optInt("anchorCount", 0) ?: 0
+            val globalNewdidLinks = json?.optInt("globalNewdidLinks", 0) ?: 0
+            val globalDataDid = json?.optInt("globalDataDid", 0) ?: 0
+            logEvent(
+                "UI: daftar village belum lengkap ${discovered.size}/${villageScanExpected}; " +
+                    "scroll pass=$villageScanScrollPass root=$rootFound anchors=$anchorCount " +
+                    "newdid=$globalNewdidLinks data-did=$globalDataDid"
+            )
+            handler.postDelayed({
+                if (villageScanActive) collectVillageTargetsFromSidebar()
+            }, 650)
+            return
+        }
+
+        if (discovered.isEmpty()) {
             villageScanRetry++
             if (villageScanRetry <= 15) {
-                if (villageScanRetry == 1 || villageScanRetry % 5 == 0) {
-                    val rootFound = json?.optBoolean("rootFound", false) == true
-                    val linkCount = json?.optInt("linkCount", 0) ?: 0
-                    val globalNewdidLinks = json?.optInt("globalNewdidLinks", 0) ?: 0
-                    val globalDataDid = json?.optInt("globalDataDid", 0) ?: 0
-                    val pageUrl = json?.optString("url", "").orEmpty()
-                    logEvent(
-                        "UI: village belum terbaca (${villageScanRetry}/15); " +
-                            "root=$rootFound, link=$linkCount, newdid=$globalNewdidLinks, " +
-                            "data-did=$globalDataDid, url=$pageUrl"
-                    )
-                }
-                handler.postDelayed({
-                    if (villageScanActive) collectVillageTargetsFromSidebar()
-                }, 700)
+                handler.postDelayed({ if (villageScanActive) collectVillageTargetsFromSidebar() }, 700)
             } else {
                 villageScanActive = false
                 farmStatus.text = "Daftar village tidak tersedia."
@@ -860,27 +904,14 @@ class MainActivity : Activity() {
             return
         }
 
-        if (villageScanExpected > 0 &&
-            unique.size < villageScanExpected &&
-            villageScanRetry < 3
-        ) {
-            villageScanRetry++
-            logEvent(
-                "UI: sidebar village ${unique.size}/${villageScanExpected}; " +
-                    "reload dorf1 (${villageScanRetry}/3)"
-            )
-            val server = normalizeServer(serverInput.text.toString())
-            handler.postDelayed({
-                if (villageScanActive) webView.loadUrl("$server/dorf1.php")
-            }, 1000)
-            return
-        }
-
-        villageScanTargets = unique.toMutableList()
+        villageScanTargets = discovered.toMutableList()
         villageScanResults.clear()
         villageMinLevels.clear()
         villageScanIndex = 0
         villageScanRetry = 0
+        villageScanDataRetry = 0
+        villageScanScrollPass = 0
+        villageScanCollectInFlight = false
 
         logEvent(
             "UI: ${villageScanTargets.size}/${villageScanExpected} village ditemukan; " +
@@ -997,7 +1028,7 @@ class MainActivity : Activity() {
 
     private fun collectCurrentVillageData() {
         debugTrace("ENTER collectCurrentVillageData")
-        if (!villageScanActive) return
+        if (!villageScanActive || villageScanCollectInFlight) return
 
         if (villageScanTargets.isEmpty()) {
             collectVillageTargetsFromSidebar()
@@ -1007,6 +1038,7 @@ class MainActivity : Activity() {
         val target = villageScanTargets.getOrNull(villageScanIndex) ?: return
         val expectedId = target.first
         val expectedIdJson = JSONObject.quote(expectedId)
+        villageScanCollectInFlight = true
 
         val js = """
             (() => {
@@ -1016,8 +1048,6 @@ class MainActivity : Activity() {
                 const match = url.match(/[?&]newdid=(\d+)/i);
                 let currentId = match ? match[1] : '';
 
-                // Travian kadang tidak memberi class .active pada entry sidebar.
-                // Jadi cek beberapa bentuk penanda aktif sebagai tambahan.
                 const activeCandidates = [
                     '#sidebarBoxVillagelist .listEntry.active',
                     '#sidebarBoxVillagelist .listEntry.selected',
@@ -1027,113 +1057,73 @@ class MainActivity : Activity() {
                 ];
                 let active = null;
                 for (const selector of activeCandidates) {
-                    try {
-                        active = document.querySelector(selector);
-                        if (active) break;
-                    } catch (_) {}
+                    try { active = document.querySelector(selector); if (active) break; } catch (_) {}
                 }
                 const activeId = active?.getAttribute('data-did') || '';
                 const activeName = clean(active?.querySelector('.name')?.textContent || '');
                 if (!currentId && /^\d+$/.test(activeId)) currentId = activeId;
 
-                const entry = [...document.querySelectorAll('[data-did]')]
-                    .find(e => String(e.getAttribute('data-did') || '') === expectedId);
-                const pageName = clean(
-                    entry?.querySelector('.name')?.textContent ||
-                    entry?.querySelector('[class*="name"]')?.textContent || ''
-                );
-
-                // Jika URL tidak membawa newdid dan tidak ada activeId, tunggu sebentar.
                 if (currentId !== expectedId) {
                     AndroidFarm.onVillageScanResult(JSON.stringify({
-                        notReady:true,
-                        id:currentId,
-                        expectedId,
-                        url,
-                        activeId,
-                        activeName,
-                        pageTitle:document.title || '',
+                        notReady:true, reason:'WRONG_VILLAGE', id:currentId, expectedId,
+                        url, activeId, activeName, pageTitle:document.title || '',
                         readyState:document.readyState
                     }));
                     return;
                 }
 
+                // RESOURCE FIELDS: jangan bergantung pada satu class. Travian dapat
+                // menaruh level pada class level10, data-level, title, aria-label,
+                // atau elemen anak dari field. Karena container khusus resource field,
+                // kita scan seluruh turunannya dan deduplicate level yang ditemukan.
                 const container = document.querySelector('#resourceFieldContainer');
                 const fields = [];
                 const debugFields = [];
-
-                if (container) {
-                    const selectors = [
-                        'a[href*="build.php?id="]',
-                        'area[href*="build.php?id="]',
-                        'a.resourceField',
-                        '[class*="resourceField"]'
+                const fieldNodes = container ? [...container.querySelectorAll('*')] : [];
+                for (const node of fieldNodes) {
+                    const candidates = [
+                        node.getAttribute?.('data-level') || '',
+                        node.getAttribute?.('title') || '',
+                        node.getAttribute?.('aria-label') || '',
+                        String(node.className || ''),
+                        clean(node.textContent || '')
                     ];
-                    const seenNodes = new Set();
-                    const nodes = [];
-                    for (const selector of selectors) {
-                        for (const node of container.querySelectorAll(selector)) {
-                            if (!seenNodes.has(node)) {
-                                seenNodes.add(node);
-                                nodes.push(node);
-                            }
-                        }
+                    let level = -1;
+                    for (const text of candidates) {
+                        const m = String(text).match(/(?:^|[\s_-])level\s*(\d+)\b/i) ||
+                                  String(text).match(/\blevel(\d+)\b/i);
+                        if (m) { level = parseInt(m[1],10); break; }
                     }
-
-                    for (const node of nodes) {
-                        const candidates = [];
-                        const push = v => {
-                            if (v != null && String(v).trim()) candidates.push(String(v));
-                        };
-                        push(node.getAttribute('data-level'));
-                        push(node.getAttribute('title'));
-                        push(node.getAttribute('aria-label'));
-                        push(node.getAttribute('class'));
-                        push(node.textContent);
-
-                        let parent = node.parentElement;
-                        for (let i = 0; i < 3 && parent; i++, parent = parent.parentElement) {
-                            push(parent.getAttribute('data-level'));
-                            push(parent.getAttribute('class'));
-                            push(parent.getAttribute('title'));
-                            push(parent.textContent);
-                        }
-
-                        let level = -1;
-                        for (const text of candidates) {
-                            const m = text.match(/\blevel\s*(\d+)\b/i) || text.match(/\blevel(\d+)\b/i);
-                            if (m) {
-                                level = parseInt(m[1], 10);
-                                break;
-                            }
-                        }
-                        if (level >= 0) fields.push(level);
-
-                        if (debugFields.length < 24) {
-                            debugFields.push({
-                                level,
-                                tag:node.tagName || '',
-                                href:node.getAttribute('href') || '',
-                                className:String(node.className || '').slice(0,160),
-                                text:clean(node.textContent || '').slice(0,80)
-                            });
+                    if (level >= 0) {
+                        fields.push(level);
+                        if (debugFields.length < 30) {
+                            debugFields.push({level, tag:node.tagName || '', className:String(node.className || '').slice(0,140), text:clean(node.textContent || '').slice(0,60)});
                         }
                     }
                 }
-
                 const levels = fields.filter(n => Number.isFinite(n));
-                const minLevel = levels.length ? Math.min(...levels) : -1;
-                const resources = {};
+                const uniqueLevels = levels.slice(0, 18);
+
+                // RESOURCE BAR: Travian resource IDs memakai urutan lama l4=wood,
+                // l3=clay, l2=iron, l1=crop. Ambil current/capacity dari text ID,
+                // atribut, parent, dan object resources/maxStorage bila tersedia.
                 const scriptText = [...document.scripts].map(s => s.textContent || '').join('\n');
                 const maxStorage = {};
+                const storage = {};
                 for (const rid of ['l1','l2','l3','l4']) {
-                    const re = new RegExp('maxStorage\\s*[:=]\\s*\\{[\\s\\S]*?\\b' + rid + '\\s*[:=]\\s*(\\d+)', 'i');
-                    const m = scriptText.match(re);
-                    if (m) maxStorage[rid] = parseInt(m[1], 10);
+                    const maxRe = new RegExp('maxStorage\\s*[:=]\\s*\\{[\\s\\S]*?\\b' + rid + '\\s*[:=]\\s*(\\d+)', 'i');
+                    const maxMatch = scriptText.match(maxRe);
+                    if (maxMatch) maxStorage[rid] = parseInt(maxMatch[1],10);
+                    const storageRe = new RegExp('storage\\s*[:=]\\s*\\{[\\s\\S]*?\\b' + rid + '\\s*[:=]\\s*(\\d+)', 'i');
+                    const sm = scriptText.match(storageRe);
+                    if (sm) storage[rid] = parseInt(sm[1],10);
                 }
+
+                const resources = {};
+                let resourceComplete = true;
                 for (const rid of ['l1','l2','l3','l4']) {
                     const el = document.getElementById(rid);
-                    if (!el) continue;
+                    if (!el) { resourceComplete = false; continue; }
                     const text = clean(el.textContent || '');
                     const attrs = [
                         el.getAttribute('data-current') || '',
@@ -1144,25 +1134,39 @@ class MainActivity : Activity() {
                     ].join(' ');
                     const parentText = clean((el.parentElement && el.parentElement.textContent) || '');
                     const source = [text, attrs, parentText].join(' ');
-                    const pair = source.match(/(\d[\d\s.,]*)\s*\/\s*(\d[\d\s.,]*)/);
-                    const current = pair ? pair[1].replace(/[^0-9]/g, '') : text.replace(/[^0-9]/g, '');
-                    const capacity = pair ? pair[2].replace(/[^0-9]/g, '') : (maxStorage[rid] || '').toString();
-                    resources[rid] = { text, current, capacity };
+                    const pair = source.match(/(-?\d[\d\s.,]*)\s*\/\s*(\d[\d\s.,]*)/);
+                    let current = pair ? pair[1].replace(/[^0-9-]/g,'') : '';
+                    let capacity = pair ? pair[2].replace(/[^0-9-]/g,'') : '';
+                    if (!current && storage[rid] != null) current = String(storage[rid]);
+                    if (!capacity && maxStorage[rid] != null) capacity = String(maxStorage[rid]);
+                    resources[rid] = {text, current, capacity};
+                    if (!current || !capacity) resourceComplete = false;
                 }
 
+                // Jangan simpan hasil setengah matang. Tunggu sampai 4 resource dan
+                // resource field sudah benar-benar dirender.
+                if (!container || uniqueLevels.length < 18 || !resourceComplete) {
+                    AndroidFarm.onVillageScanResult(JSON.stringify({
+                        notReady:true, reason:'DOM_DATA_INCOMPLETE', id:currentId, expectedId,
+                        url, activeId, activeName, fieldCount:uniqueLevels.length,
+                        resourceComplete, resourceContainer:!!container,
+                        resources, debugFields:debugFields.slice(0,12)
+                    }));
+                    return;
+                }
+
+                const entry = [...document.querySelectorAll('[data-did]')]
+                    .find(e => String(e.getAttribute('data-did') || '') === expectedId);
+                const pageName = clean(
+                    entry?.querySelector('.name')?.textContent ||
+                    entry?.querySelector('[class*="name"]')?.textContent || activeName || ''
+                );
+
                 AndroidFarm.onVillageScanResult(JSON.stringify({
-                    id:expectedId,
-                    name:pageName || activeName || '',
-                    minLevel,
-                    fields:levels.slice(0, 18),
-                    fieldNodeCount:container ? container.querySelectorAll('*').length : 0,
-                    debugFieldCount:debugFields.length,
-                    debugFields,
-                    resourceContainer:!!container,
-                    activeId,
-                    activeName,
-                    url,
-                    resources
+                    id:expectedId, name:pageName, minLevel:Math.min(...uniqueLevels),
+                    fields:uniqueLevels, fieldNodeCount:fieldNodes.length,
+                    debugFieldCount:debugFields.length, debugFields,
+                    resourceContainer:true, activeId, activeName, url, resources
                 }));
             })();
         """.trimIndent()
@@ -1176,22 +1180,24 @@ class MainActivity : Activity() {
         val json = runCatching { JSONObject(rawJson) }.getOrNull()
 
         if (json?.optBoolean("notReady", false) == true) {
+            villageScanCollectInFlight = false
+            villageScanDataRetry++
             villageScanPageRetry++
 
-            if (villageScanPageRetry <= 10) {
+            if (villageScanDataRetry <= 14) {
                 if (villageScanPageRetry == 1 || villageScanPageRetry == 10) {
                     logEvent(
                         "UI: [${villageScanIndex + 1}/${villageScanTargets.size}] " +
-                            "belum terdeteksi target=${json.optString("expectedId")}, " +
+                            "data belum siap reason=${json.optString("reason").ifBlank { "UNKNOWN" }}; " +
+                            "target=${json.optString("expectedId")}; " +
                             "current=${json.optString("id").ifBlank { "-" }}; " +
-                            "active=${json.optString("activeName").ifBlank { "-" }}(" +
-                            "${json.optString("activeId").ifBlank { "-" }}); " +
+                            "fields=${json.optInt("fieldCount", 0)}; " +
+                            "resourceComplete=${json.optBoolean("resourceComplete", false)}; " +
                             "ready=${json.optString("readyState").ifBlank { "-" }}; " +
-                            "title=${json.optString("pageTitle").take(50)}; " +
                             "url=${json.optString("url").ifBlank { "-" }}"
                     )
                 }
-                handler.postDelayed({ collectCurrentVillageData() }, 500)
+                handler.postDelayed({ if (villageScanActive) collectCurrentVillageData() }, 700)
             } else {
                 // Satu village gagal tidak boleh mengunci seluruh scanner.
                 val (_, name) = villageScanTargets[villageScanIndex]
@@ -1200,12 +1206,16 @@ class MainActivity : Activity() {
                         "$name timeout; village dilewati"
                 )
                 villageScanIndex++
-                handler.postDelayed({ visitNextVillageForScan() }, 300)
+                villageScanDataRetry = 0
+                villageScanCollectInFlight = false
+                handler.postDelayed({ visitNextVillageForScan() }, 500)
             }
             return
         }
 
+        villageScanCollectInFlight = false
         villageScanPageRetry = 0
+        villageScanDataRetry = 0
 
         val target = villageScanTargets.getOrNull(villageScanIndex) ?: return
         val id = json?.optString("id").orEmpty().ifBlank { target.first }
@@ -1241,10 +1251,11 @@ class MainActivity : Activity() {
             val capacity = item.optString("capacity", "").replace(".", "").replace(",", "").toIntOrNull() ?: -1
             return current to capacity
         }
-        val wood = pair("l1")
-        val clay = pair("l2")
-        val iron = pair("l3")
-        val crop = pair("l4")
+        // Travian resource bar: l4=wood, l3=clay, l2=iron, l1=crop.
+        val wood = pair("l4")
+        val clay = pair("l3")
+        val iron = pair("l2")
+        val crop = pair("l1")
         resourceSnapshots[id] = ResourceSnapshot(
             villageId = id, villageName = name,
             wood = wood.first, woodCap = wood.second,
