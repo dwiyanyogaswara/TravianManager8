@@ -144,6 +144,9 @@ class FarmAutomationService : Service() {
     private val builderResourceLevels = linkedMapOf<String, Int>()
     private var pendingBuilderResourceHref = ""
     private var builderVillageClickInProgress = false
+    // State machine agar callback onPageFinished tidak menjalankan Builder
+    // berulang-ulang pada dorf1.php atau salah mengklik tombol di halaman lain.
+    private var builderStage = "IDLE"
 
     private var pendingUpgradeUrl = ""
     private var pendingUpgradeCosts = longArrayOf(0L, 0L, 0L, 0L)
@@ -441,23 +444,37 @@ class FarmAutomationService : Service() {
             }
 
             if (builderInProgress && lower.contains("dorf1.php")) {
+                val expectedId = builderVillages.getOrNull(builderVillageIndex)?.first.orEmpty()
+                val currentId = Regex("[?&]newdid=(\\d+)", RegexOption.IGNORE_CASE)
+                    .find(lower)?.groupValues?.getOrNull(1).orEmpty()
+
                 if (builderVillages.isEmpty()) {
+                    builderStage = "DISCOVER"
                     handler.postDelayed({ discoverVillagesForBuilder() }, 700)
-                } else if (builderVillageClickInProgress && pendingBuilderResourceHref.isNotBlank()) {
-                    // Setelah klik village, halaman dorf1?newdid=... selesai dimuat.
-                    // Baru sekarang buka href resource yang sudah disimpan.
-                    if (lower.contains("newdid=")) {
-                        handler.postDelayed({ openSavedBuilderResource() }, 700)
-                    } else {
-                        handler.postDelayed({ clickBuilderVillageFromDorf() }, 500)
+                } else if (expectedId.isNotBlank() && currentId == expectedId &&
+                    pendingBuilderResourceHref.isNotBlank()) {
+                    // Village yang benar sudah aktif. SEKARANG baru buka href
+                    // resource yang telah disimpan oleh scanner.
+                    if (builderStage != "OPEN_RESOURCE" && builderStage != "WAIT_UPGRADE" &&
+                        builderStage != "ADVANCING") {
+                        builderStage = "OPEN_RESOURCE"
+                        handler.postDelayed({ openSavedBuilderResource() }, 500)
                     }
+                } else if (builderStage == "LOAD_DORF" || builderStage == "CLICK_VILLAGE") {
+                    // Masih berada di daftar village: klik village yang dipilih.
+                    builderStage = "CLICK_VILLAGE"
+                    handler.postDelayed({ clickBuilderVillageFromDorf() }, 400)
                 } else {
-                    handler.postDelayed({ processResourceBuilderVillage() }, 500)
+                    // Jangan pernah memanggil processResourceBuilderVillage() dari
+                    // onPageFinished dorf1.php secara membabi buta. Ini sebelumnya
+                    // menyebabkan loop dan bahkan bisa mengklik tombol Rally Point.
+                    logEvent("Resource Builder: dorf1 menunggu village target; stage=$builderStage current=$currentId expected=$expectedId")
                 }
                 return@acceptCookiesIfPresent
             }
 
             if (builderInProgress && lower.contains("build.php") && !lower.contains("gid=16")) {
+                builderStage = "INSPECT_UPGRADE"
                 handler.postDelayed({ inspectUpgradeResources() }, 700)
                 return@acceptCookiesIfPresent
             }
@@ -598,9 +615,14 @@ class FarmAutomationService : Service() {
                 };
                 const dispatch = btn => {
                     btn.scrollIntoView({block:'center'});
-                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
-                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
-                    btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                    // Gunakan native HTMLElement.click() terlebih dahulu. Beberapa
+                    // handler Travian/jQuery tidak bereaksi terhadap MouseEvent buatan.
+                    try { btn.click(); } catch (_) {}
+                    // Event fallback untuk markup/handler lama.
+                    try {
+                        btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+                        btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+                    } catch (_) {}
                 };
                 const selectors = [
                     '#rallyPointFarmList button.startAllFarmLists',
@@ -665,6 +687,12 @@ class FarmAutomationService : Service() {
     private fun verifyRaidDispatch() {
         debugTrace("ENTER verifyRaidDispatch")
         if (!running) return
+
+        // Farm List adalah aksi dispatch, bukan proses yang harus ditunggu sampai
+        // semua tombol Start menjadi disabled. Pada Travian tombol Start sering tetap
+        // aktif walaupun request raid sudah berhasil dikirim. Verifikasi lama bisa
+        // polling 20x + fallback + reload sampai watchdog 5 menit dan membuat
+        // Resource Builder tidak pernah kebagian waktu.
         val js = """
             (() => {
                 const visible = el => {
@@ -687,6 +715,7 @@ class FarmAutomationService : Service() {
                 return JSON.stringify({total, wrappers, ready, busy});
             })();
         """.trimIndent()
+
         automationWebView()?.evaluateJavascript(js) { raw ->
             val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
             val current = Regex("\"total\":(\\d+)").find(result)?.groupValues?.get(1)?.toIntOrNull() ?: 0
@@ -697,28 +726,31 @@ class FarmAutomationService : Service() {
             if (current > raidCountBeforeStartAll || ready < farmListBeforeReady || busy) {
                 farmListProgressObserved = true
             }
-            val state = "$current|$ready|$busy|$wrappers"
-            if (state == farmListLastState) farmListStableChecks++ else {
-                farmListLastState = state
-                farmListStableChecks = 1
-            }
-            val completionProven = wrappers > 0 && ready == 0 && !busy &&
-                (farmListProgressObserved || farmListBeforeReady == 0) &&
-                farmListStableChecks >= 2
 
-            if (completionProven) {
+            // Beri AJAX Travian waktu singkat untuk mulai, tetapi jangan pernah
+            // menahan siklus sampai menit ke-5 hanya karena tombol Start tetap aktif.
+            val elapsedChecks = raidVerificationAttempt
+            val dispatchSettled = wrappers > 0 && !busy &&
+                (farmListProgressObserved || elapsedChecks >= 4)
+
+            if (dispatchSettled || elapsedChecks >= 6) {
                 val sent = (current - raidCountBeforeStartAll).coerceAtLeast(0)
-                logEvent("Hasil Send All Farm: $sent raid terkirim (being raided $raidCountBeforeStartAll → $current); SELURUH FARM LIST SELESAI TERVERIFIKASI")
-                updateNotification("Farm List selesai — $sent raid terkirim")
+                logEvent(
+                    "Farm List selesai dispatch: $sent raid terdeteksi; " +
+                        "tombol Start aktif=$ready; verifikasi=${elapsedChecks + 1}x — lanjut Resource Builder"
+                )
+                updateNotification("Farm List selesai — Resource Builder dimulai")
+                pendingStartAll = false
+                fallbackFarmListMode = false
                 if (resourceBuilderEnabled) startResourceBuilderCycle() else scheduleNextRandomRun()
-            } else if (raidVerificationAttempt < 20) {
-                raidVerificationAttempt++
-                logEvent("Farm List BELUM selesai (${raidVerificationAttempt}/20); raid=$current; tombol Start aktif=$ready; busy=$busy; progress=${if (farmListProgressObserved) "YA" else "BELUM"}")
-                updateNotification("Farm List — verifikasi ${raidVerificationAttempt}/20; masih diproses")
-                handler.postDelayed({ verifyRaidDispatch() }, 1500)
             } else {
-                logEvent("Send All belum terverifikasi selesai setelah 20 pemeriksaan; Farm List TETAP dianggap belum selesai — fallback dijalankan")
-                fallbackSequentialFarmListSend()
+                raidVerificationAttempt++
+                logEvent(
+                    "Farm List verifikasi ${raidVerificationAttempt}/6; raid=$current; " +
+                        "tombol Start aktif=$ready; busy=$busy; progress=${if (farmListProgressObserved) "YA" else "BELUM"}"
+                )
+                updateNotification("Farm List — dispatch ${raidVerificationAttempt}/6")
+                handler.postDelayed({ verifyRaidDispatch() }, 1000)
             }
         }
     }
@@ -748,9 +780,11 @@ class FarmAutomationService : Service() {
                 const totalBefore = statusCount();
                 for (const btn of buttons) {
                     btn.scrollIntoView({block:'center'});
-                    btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
-                    btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
-                    btn.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+                    try { btn.click(); } catch (_) {}
+                    try {
+                        btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+                        btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+                    } catch (_) {}
                 }
                 return JSON.stringify({clicked:buttons.length, readyBefore, totalBefore});
             })();
@@ -763,7 +797,7 @@ class FarmAutomationService : Service() {
             farmListLastState = ""
             farmListStableChecks = 0
             fallbackFarmListMode = true
-            logEvent("Fallback Start per Farm List: $clicked tombol diklik; sebelum=$farmListBeforeReady tombol siap; Farm List TETAP belum dianggap selesai")
+            logEvent("Fallback Start per Farm List: $clicked tombol diklik; sebelum=$farmListBeforeReady tombol siap; verifikasi maksimal 6 detik")
             raidVerificationAttempt = 0
             handler.post({ verifyFallbackRaidCompletion() })
         }
@@ -772,65 +806,50 @@ class FarmAutomationService : Service() {
     private fun verifyFallbackRaidCompletion() {
         debugTrace("ENTER verifyFallbackRaidCompletion")
         if (!running) return
+
+        // Fallback hanya memastikan request sudah diberi kesempatan diproses.
+        // Jangan reload Farm List berulang-ulang: reload + polling lama dapat
+        // menghabiskan seluruh watchdog dan mencegah Resource Builder berjalan.
         val js = """
             (() => {
-                const visible = el => {
-                    if (!el) return false;
-                    const s = getComputedStyle(el), r = el.getBoundingClientRect();
-                    return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 0 && r.height > 0;
-                };
-                let total = 0, ready = 0, wrappers = 0;
+                const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+                let total = 0, wrappers = 0;
                 for (const wrapper of document.querySelectorAll('#rallyPointFarmList .farmListWrapper')) {
                     wrappers++;
-                    const m = (wrapper.querySelector('.farmListStatus')?.textContent || '').replace(/\s+/g,' ').match(/(\d+)\s*\/\s*(\d+)/);
-                    if (m) total += parseInt(m[1],10);
-                    const btn = wrapper.querySelector('button.startFarmList');
-                    if (btn && visible(btn) && !btn.disabled && btn.getAttribute('disabled') === null && btn.getAttribute('aria-disabled') !== 'true') ready++;
+                    const m = norm(wrapper.querySelector('.farmListStatus')?.textContent || '').match(/(\d+)\s*\/\s*(\d+)/);
+                    if (m) total += parseInt(m[1], 10);
                 }
-                const allText = (document.querySelector('#rallyPointFarmList')?.innerText || '').replace(/\s+/g,' ').toLowerCase();
+                const allText = norm(document.querySelector('#rallyPointFarmList')?.innerText || '');
                 const busy = /sending|loading|processing|mengirim|memproses/.test(allText);
-                return JSON.stringify({total, ready, wrappers, busy});
+                return JSON.stringify({total, wrappers, busy});
             })();
         """.trimIndent()
+
         automationWebView()?.evaluateJavascript(js) { raw ->
             val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
             val current = Regex("\"total\":(\\d+)").find(result)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-            val ready = Regex("\"ready\":(\\d+)").find(result)?.groupValues?.get(1)?.toIntOrNull() ?: 0
-            val busy = Regex("\"busy\":(true|false)").find(result)?.groupValues?.get(1) == "true"
             val wrappers = Regex("\"wrappers\":(\\d+)").find(result)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val busy = Regex("\"busy\":(true|false)").find(result)?.groupValues?.get(1) == "true"
 
-            if (current > raidCountBeforeStartAll || ready < farmListBeforeReady || busy) {
-                farmListProgressObserved = true
-            }
-            val state = "$current|$ready|$busy|$wrappers"
-            if (state == farmListLastState) farmListStableChecks++ else {
-                farmListLastState = state
-                farmListStableChecks = 1
-            }
-            val completionProven = wrappers > 0 && ready == 0 && !busy &&
-                (farmListProgressObserved || farmListBeforeReady == 0) &&
-                farmListStableChecks >= 2
+            raidVerificationAttempt++
+            if (busy) farmListProgressObserved = true
+            val sent = (current - raidCountBeforeStartAll).coerceAtLeast(0)
 
-            if (completionProven) {
-                val sent = (current - raidCountBeforeStartAll).coerceAtLeast(0)
-                logEvent("Hasil Send All Farm: $sent raid terkirim setelah fallback (being raided $raidCountBeforeStartAll → $current); SEMUA FARM LIST SELESAI TERVERIFIKASI")
-                updateNotification("Farm List selesai — $sent raid terkirim")
+            // Maksimal 6 detik. Jika status raid tidak berubah, tetap lanjut karena
+            // tujuan fallback adalah dispatch, bukan menunggu counter berubah.
+            if (!busy && (farmListProgressObserved || raidVerificationAttempt >= 3) || raidVerificationAttempt >= 6) {
+                logEvent(
+                    "Fallback Farm List selesai dispatch: $sent raid terdeteksi; " +
+                        "wrappers=$wrappers; lanjut Resource Builder"
+                )
+                updateNotification("Farm List selesai — Resource Builder dimulai")
                 fallbackFarmListMode = false
+                pendingStartAll = false
                 if (resourceBuilderEnabled) startResourceBuilderCycle() else scheduleNextRandomRun()
             } else {
-                raidVerificationAttempt++
-                if (raidVerificationAttempt >= 20) {
-                    logEvent("Fallback belum terverifikasi selesai; Farm List dimuat ulang dan verifikasi dilanjutkan")
-                    raidVerificationAttempt = 0
-                    farmListLastState = ""
-                    farmListStableChecks = 0
-                    automationWebView()?.loadUrl("$server/build.php?id=39&gid=16&tt=99")
-                    handler.postDelayed({ verifyFallbackRaidCompletion() }, 2500)
-                } else {
-                    logEvent("Fallback BELUM selesai (${raidVerificationAttempt}/20); raid=$current; tombol Start aktif=$ready; busy=$busy; progress=${if (farmListProgressObserved) "YA" else "BELUM"}")
-                    updateNotification("Farm List — fallback verifikasi ${raidVerificationAttempt}/20")
-                    handler.postDelayed({ verifyFallbackRaidCompletion() }, 1500)
-                }
+                logEvent("Fallback Farm List menunggu dispatch ${raidVerificationAttempt}/6; raid=$current; busy=$busy")
+                updateNotification("Farm List — fallback ${raidVerificationAttempt}/6")
+                handler.postDelayed({ verifyFallbackRaidCompletion() }, 1000)
             }
         }
     }
@@ -892,6 +911,7 @@ class FarmAutomationService : Service() {
         builderAttempt = 0
         pendingBuilderResourceHref = resourceHref
         builderVillageClickInProgress = true
+        builderStage = "LOAD_DORF"
         val savedLevel = builderResourceLevels[villageId]
         logEvent(
             "Resource Builder: village ${builderVillageIndex + 1}/${builderVillages.size} — $villageName (ID $villageId); " +
@@ -911,8 +931,9 @@ class FarmAutomationService : Service() {
         val (villageId, villageName) = builderVillages.getOrNull(builderVillageIndex)
             ?: return
         val expectedId = villageId
-        val href = pendingBuilderResourceHref
+        val href = absoluteBuilderHref(pendingBuilderResourceHref)
         val hrefJson = JSONObject.quote(href)
+        builderStage = "OPEN_RESOURCE"
         val idJson = JSONObject.quote(expectedId)
 
         val js = """
@@ -1011,6 +1032,7 @@ class FarmAutomationService : Service() {
         automationWebView()?.evaluateJavascript(js) { raw ->
             val result = raw.orEmpty().trim('"')
             if (result == "clicked") {
+                builderStage = "WAIT_VILLAGE"
                 logEvent("Resource Builder: klik village ${village.second} (ID ${village.first}) dari dorf1.php")
             } else if (builderAttempt < 5) {
                 builderAttempt++
@@ -1114,6 +1136,21 @@ class FarmAutomationService : Service() {
     private fun inspectUpgradeResources() {
         debugTrace("ENTER inspectUpgradeResources")
         if (!running || !builderInProgress) return
+
+        // Guard penting: jangan pernah mencari tombol "Upgrade/Build" di dorf1.php.
+        // Sebelumnya halaman Rally Point di dorf1 dapat dianggap sebagai target
+        // dan Builder lalu melaporkan "upgrade berhasil" padahal resource field
+        // tidak pernah dibuka.
+        val currentUrl = automationWebView()?.url.orEmpty()
+        if (!currentUrl.contains("build.php", ignoreCase = true) ||
+            currentUrl.contains("gid=16", ignoreCase = true)) {
+            logEvent("Resource Builder: halaman target bukan build.php; URL=$currentUrl; membuka ulang target tersimpan")
+            builderStage = "OPEN_RESOURCE"
+            handler.postDelayed({ openSavedBuilderResource() }, 400)
+            return
+        }
+
+        builderStage = "INSPECT_UPGRADE"
         val js = """
             (() => {
                 const num = s => {
@@ -1391,6 +1428,17 @@ class FarmAutomationService : Service() {
     private fun clickResourceUpgrade() {
         debugTrace("ENTER clickResourceUpgrade")
         if (!running || !builderInProgress) return
+
+        val currentUrl = automationWebView()?.url.orEmpty()
+        if (!currentUrl.contains("build.php", ignoreCase = true) ||
+            currentUrl.contains("gid=16", ignoreCase = true)) {
+            logEvent("Resource Builder: batal klik Upgrade karena bukan halaman resource build.php; URL=$currentUrl")
+            builderStage = "OPEN_RESOURCE"
+            handler.postDelayed({ openSavedBuilderResource() }, 400)
+            return
+        }
+
+        builderStage = "WAIT_UPGRADE"
         val js = """
             (() => {
                 const visible = el => {
@@ -1445,8 +1493,23 @@ class FarmAutomationService : Service() {
 
     private fun goToNextBuilderVillage() {
         debugTrace("ENTER goToNextBuilderVillage")
+        if (!builderInProgress) return
+
+        // Cegah callback ganda menaikkan index dua kali.
+        if (builderStage == "ADVANCING") return
+        builderStage = "ADVANCING"
+
+        pendingBuilderResourceHref = ""
+        builderVillageClickInProgress = false
+        pendingUpgradeUrl = ""
+        pendingUpgradeCosts = longArrayOf(0L, 0L, 0L, 0L)
+
         builderVillageIndex++
-        handler.postDelayed({ processResourceBuilderVillage() }, 700)
+        handler.postDelayed({
+            if (!running || !builderInProgress) return@postDelayed
+            builderStage = "LOAD_DORF"
+            processResourceBuilderVillage()
+        }, 700)
     }
 
     private fun finishResourceBuilderCycle() {
@@ -1466,6 +1529,8 @@ class FarmAutomationService : Service() {
         builderVillageIndex = 0
         pendingBuilderResourceHref = ""
         builderVillageClickInProgress = false
+        builderStage = "IDLE"
+        builderStage = "IDLE"
         logEvent("Resource Builder: siklus selesai")
         scheduleNextRandomRun()
         updateNotification("Next Run ${timeFormat.format(Date(nextAt))} | dalam ${formatDuration((nextAt - System.currentTimeMillis()).coerceAtLeast(0L))}")
