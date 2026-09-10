@@ -278,7 +278,7 @@ class MainActivity : Activity() {
      * ke SharedPreferences. Ini memungkinkan auto re-login ketika session
      * Travian expired, selama proses aplikasi masih berjalan.
      */
-    private fun handleBotToggle(_: CompoundButton, checked: Boolean) {
+    private fun handleBotToggle(button: CompoundButton, checked: Boolean) {
         debugTrace("ENTER handleBotToggle")
         if (checked) {
             if (!startSchedulerFromToggle()) {
