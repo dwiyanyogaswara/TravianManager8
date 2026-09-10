@@ -737,66 +737,47 @@ class MainActivity : Activity() {
                 const clean = s => String(s || '').replace(/\s+/g,' ').trim();
                 const out = [];
                 const seen = new Set();
-
-                // Jangan bergantung pada satu wrapper/sidebar. Travian punya beberapa
-                // variasi layout: sidebarBoxVillagelist, villageList, dan li/a.
                 const root = document.querySelector('#sidebarBoxVillagelist');
-                const selectors = [
-                    '#sidebarBoxVillagelist .listEntry[data-did]',
-                    '#sidebarBoxVillagelist a[href*="newdid="]',
-                    '#villageList a[href*="newdid="]',
-                    '.villageList a[href*="newdid="]',
-                    'a[href*="dorf1.php?newdid="]',
-                    'a[href*="dorf1.php&newdid="]',
-                    // Pada halaman Travian yang sedang dipakai, village link ternyata
-                    // berupa href="?newdid=ID&" tanpa prefix dorf1.php dan berada di
-                    // luar #sidebarBoxVillagelist. LIVE logger membuktikan link ini
-                    // memang ada, jadi scanner juga harus membaca selector global ini.
-                    'a[href*="?newdid="]'
-                ];
 
-                const nodes = [];
-                for (const selector of selectors) {
-                    for (const node of document.querySelectorAll(selector)) nodes.push(node);
-                }
+                // Ikuti persis cara Live Click Logger menemukan village:
+                // cari anchor yang bisa diklik, lalu ambil data-did dari anchor
+                // atau ancestor .listEntry/.dropContainer/li. Pada halaman ini
+                // anchor village dapat berupa href="#", jadi href bukan sumber ID utama.
+                const anchors = [...document.querySelectorAll('a')];
+                for (const anchor of anchors) {
+                    const entry = anchor.closest('.listEntry, .dropContainer, li');
+                    const href = anchor.getAttribute('href') || '';
+                    const dataDid = anchor.getAttribute('data-did') ||
+                        entry?.getAttribute('data-did') || '';
+                    const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
 
-                for (const node of nodes) {
-                    let entry = node;
-                    if (!entry.matches('.listEntry[data-did]')) {
-                        entry = node.closest('.listEntry, li, .dropContainer');
-                    }
-
-                    const href = node.getAttribute('href') || entry?.querySelector('a[href]')?.getAttribute('href') || '';
-
-                    // Abaikan link build.php?newdid=... karena itu bukan item village.
-                    // Item village yang kita inginkan pada layout ini berbentuk
-                    // ?newdid=ID& atau dorf1.php?newdid=ID.
+                    // build.php?newdid=... terbukti muncul sebagai link lain di
+                    // halaman. Itu bukan target village sidebar dan harus dibuang.
                     if (/^\s*\/?build\.php(?:[?&]|$)/i.test(href)) continue;
 
-                    const idMatch = href.match(/[?&]newdid=(\d+)/i) ||
-                                    String(node.getAttribute('data-did') || '').match(/^(\d+)$/);
-                    const id = idMatch ? idMatch[1] : clean(node.getAttribute('data-did'));
+                    const id = /^\d+$/.test(dataDid) ? dataDid : hrefDid;
                     if (!/^\d+$/.test(id) || seen.has(id)) continue;
 
-                    let name = '';
-                    if (entry) {
-                        name = clean(
-                            entry.querySelector('.name')?.textContent ||
-                            entry.querySelector('[class*="name"]')?.textContent || ''
-                        );
-                    }
-                    if (!name) {
-                        name = clean(node.querySelector?.('.name')?.textContent || '');
-                    }
-                    if (!name) {
-                        const raw = clean(node.textContent || node.getAttribute('title') || node.getAttribute('aria-label') || '');
-                        // Koordinat biasanya berada di sibling/child, jangan jadikan sebagai nama.
-                        name = raw.replace(/\(\s*[−-]?\d+\s*\|\s*[−-]?\d+\s*\)/g, '').trim();
-                    }
+                    let name = clean(
+                        entry?.querySelector('.name')?.textContent ||
+                        anchor.querySelector?.('.name')?.textContent ||
+                        anchor.getAttribute('title') ||
+                        anchor.getAttribute('aria-label') ||
+                        anchor.textContent || ''
+                    );
+                    name = name.replace(/\(\s*[−-]?\d+\s*\|\s*[−-]?\d+\s*\)/g, '').trim();
                     if (!name) name = 'Village ' + id;
 
                     seen.add(id);
-                    out.push({id, name, href: href || ('dorf1.php?newdid=' + encodeURIComponent(id))});
+                    out.push({
+                        id,
+                        name,
+                        href,
+                        tag: anchor.tagName || '',
+                        idAttr: anchor.id || '',
+                        className: clean(anchor.className || '').slice(0,100),
+                        matchSource: dataDid ? 'data-did' : 'href'
+                    });
                 }
 
                 const bodyText = clean(document.body?.innerText || '');
@@ -807,8 +788,10 @@ class MainActivity : Activity() {
                     villages: out,
                     expected,
                     rootFound: !!root,
-                    linkCount: nodes.length,
+                    anchorCount: anchors.length,
+                    villageCount: out.length,
                     globalNewdidLinks: document.querySelectorAll('a[href*="newdid="]').length,
+                    globalDataDid: document.querySelectorAll('[data-did]').length,
                     url: location.href
                 }));
             })();
@@ -857,10 +840,13 @@ class MainActivity : Activity() {
                 if (villageScanRetry == 1 || villageScanRetry % 5 == 0) {
                     val rootFound = json?.optBoolean("rootFound", false) == true
                     val linkCount = json?.optInt("linkCount", 0) ?: 0
+                    val globalNewdidLinks = json?.optInt("globalNewdidLinks", 0) ?: 0
+                    val globalDataDid = json?.optInt("globalDataDid", 0) ?: 0
                     val pageUrl = json?.optString("url", "").orEmpty()
                     logEvent(
                         "UI: village belum terbaca (${villageScanRetry}/15); " +
-                            "root=$rootFound, link=$linkCount, url=$pageUrl"
+                            "root=$rootFound, link=$linkCount, newdid=$globalNewdidLinks, " +
+                            "data-did=$globalDataDid, url=$pageUrl"
                     )
                 }
                 handler.postDelayed({
@@ -929,76 +915,84 @@ class MainActivity : Activity() {
             (() => {
                 const id = $idJson;
                 const clean = s => String(s || '').replace(/\s+/g, ' ').trim();
-                const candidates = [];
-                const selectors = [
-                    '#sidebarBoxVillagelist .listEntry[data-did="' + id + '"]',
-                    '.villageList .listEntry[data-did="' + id + '"]',
-                    '.listEntry[data-did="' + id + '"]'
-                ];
-                for (const selector of selectors) {
-                    try { candidates.push(...document.querySelectorAll(selector)); } catch (_) {}
-                }
+                const anchors = [...document.querySelectorAll('a')];
+                let anchor = null;
+                let entry = null;
+                let matchSource = '';
 
-                let entry = candidates.find(Boolean) || null;
-                let anchor = entry?.querySelector('a') || null;
+                // Gunakan aturan yang sama dengan Live Click Logger:
+                // data-did bisa berada pada anchor atau ancestor entry.
+                for (const candidate of anchors) {
+                    const candidateEntry = candidate.closest('.listEntry, .dropContainer, li');
+                    const href = candidate.getAttribute('href') || '';
+                    const dataDid = candidate.getAttribute('data-did') ||
+                        candidateEntry?.getAttribute('data-did') || '';
+                    const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
 
-                // Fallback: cari link yang membawa newdid=id.
-                if (!anchor) {
-                    const links = [...document.querySelectorAll('a[href*="newdid="]')];
-                    anchor = links.find(a => {
-                        const href = a.getAttribute('href') || '';
-                        return new RegExp('[?&]newdid=' + id + '(?:&|$)').test(href);
-                    }) || null;
+                    if (/^\s*\/?build\.php(?:[?&]|$)/i.test(href)) continue;
+                    const villageId = /^\d+$/.test(dataDid) ? dataDid : hrefDid;
+                    if (villageId !== id) continue;
+
+                    anchor = candidate;
+                    entry = candidateEntry;
+                    matchSource = dataDid ? 'data-did' : 'href';
+                    break;
                 }
 
                 const name = clean(
                     entry?.querySelector('.name')?.textContent ||
+                    anchor?.querySelector?.('.name')?.textContent ||
+                    anchor?.getAttribute('title') ||
+                    anchor?.getAttribute('aria-label') ||
                     anchor?.textContent || ''
-                );
+                ).replace(/\(\s*[−-]?\d+\s*\|\s*[−-]?\d+\s*\)/g, '').trim();
                 const href = anchor?.getAttribute('href') || '';
 
                 AndroidFarm.onLiveClickResult(JSON.stringify({
                     kind:'AUTO_VILLAGE_CLICK_ATTEMPT',
-                    id,
-                    name,
-                    href,
-                    found:!!anchor,
+                    id, name, href, found:!!anchor, matchSource,
+                    entryTag:entry?.tagName || '',
+                    entryClass:clean(entry?.className || '').slice(0,100),
+                    anchorId:anchor?.id || '',
+                    anchorClass:clean(anchor?.className || '').slice(0,100),
                     pageUrl:location.href
                 }));
 
                 if (anchor) {
                     try {
-                        anchor.scrollIntoView({block:'center'});
+                        anchor.scrollIntoView({block:'center', inline:'nearest'});
+                        window.__farmAutoVillageClickSent = id;
                         anchor.click();
                         AndroidFarm.onLiveClickResult(JSON.stringify({
-                            kind:'AUTO_VILLAGE_CLICK_SENT', id, name, href, pageUrl:location.href
+                            kind:'AUTO_VILLAGE_CLICK_SENT', id, name, href,
+                            matchSource, pageUrl:location.href
                         }));
-                        return;
+                        return true;
                     } catch (e) {
                         AndroidFarm.onLiveClickResult(JSON.stringify({
                             kind:'AUTO_VILLAGE_CLICK_ERROR', id, name, href,
-                            error:String(e), pageUrl:location.href
+                            matchSource, error:String(e), pageUrl:location.href
                         }));
                     }
                 }
 
                 AndroidFarm.onLiveClickResult(JSON.stringify({
                     kind:'AUTO_VILLAGE_CLICK_FALLBACK', id, name,
-                    pageUrl:location.href
+                    matchSource, pageUrl:location.href
                 }));
+                return false;
             })();
         """.trimIndent()
-        webView.evaluateJavascript(js, null)
-
-        // Fallback jika DOM ternyata tidak menyediakan elemen village.
-        handler.postDelayed({
-            if (!villageScanActive) return@postDelayed
-            val currentTarget = villageScanTargets.getOrNull(villageScanIndex) ?: return@postDelayed
-            if (currentTarget.first != id) return@postDelayed
-            logEvent("UI: [$progress] fallback navigasi URL → $name (ID $id)")
-            val server = normalizeServer(serverInput.text.toString())
-            webView.loadUrl("$server/dorf1.php?newdid=$id")
-        }, 1200)
+        webView.evaluateJavascript(js) { result ->
+            debugTrace("AUTO village click callback result=$result")
+            if (result == "false") {
+                logEvent("UI: [$progress] target $name (ID $id) tidak bisa diklik; fallback loadUrl")
+                val server = normalizeServer(serverInput.text.toString())
+                webView.loadUrl("$server/dorf1.php?newdid=$id")
+            } else {
+                logEvent("UI: [$progress] click target $name (ID $id) berhasil dikirim ke Travian")
+            }
+        }
     }
 
     private fun collectCurrentVillageData() {
@@ -1807,6 +1801,8 @@ class MainActivity : Activity() {
                     "LIVE AUTO VILLAGE: cari target id=${json.optString("id")}; " +
                         "name=${json.optString("name").ifBlank { "-" }}; " +
                         "found=${json.optBoolean("found")}; href=${json.optString("href").ifBlank { "-" }}; " +
+                        "source=${json.optString("matchSource").ifBlank { "-" }}; " +
+                        "entry=${json.optString("entryTag").ifBlank { "-" }}; " +
                         "page=${json.optString("pageUrl").ifBlank { "-" }}"
                 )
             }
