@@ -109,7 +109,7 @@ class FarmAutomationService : Service() {
     private var nextAt = 0L
     private val cycleWatchdogRunnable = Runnable {
         if (!running) return@Runnable
-        logEvent("WATCHDOG: siklus berjalan >60 detik — proses aktif diakhiri agar scheduler tidak stuck")
+        logEvent("WATCHDOG: fase siklus berjalan >5 menit — proses aktif diakhiri agar scheduler tidak stuck")
         pendingStartAll = false
         builderInProgress = false
         loginInProgress = false
@@ -118,7 +118,7 @@ class FarmAutomationService : Service() {
         pendingUpgradeCosts = longArrayOf(0L, 0L, 0L, 0L)
         try { automationWebView()?.stopLoading() } catch (_: Exception) {}
         scheduleNextRandomRun()
-        updateNotification("Siklus dihentikan oleh watchdog 60 detik")
+        updateNotification("Siklus dihentikan oleh watchdog 5 menit")
     }
     private var resourceBuilderEnabled = true
     private var farmListEnabled = true
@@ -365,7 +365,9 @@ class FarmAutomationService : Service() {
             .apply()
         logEvent("Siklus dimulai pada $now")
         handler.removeCallbacks(cycleWatchdogRunnable)
-        handler.postDelayed(cycleWatchdogRunnable, 60_000L)
+        // Farm List + verifikasi dapat membutuhkan >60 detik untuk banyak village.
+        // Watchdog 5 menit mencegah false timeout sebelum Resource Builder sempat jalan.
+        handler.postDelayed(cycleWatchdogRunnable, 5 * 60_000L)
         if (farmListEnabled) {
             triggerStartAllFarmLists()
         } else if (resourceBuilderEnabled) {
@@ -813,6 +815,10 @@ class FarmAutomationService : Service() {
         builderAttempt = 0
         updateNotification("Farm Assistant — Resource Builder menyiapkan village")
         logEvent("Resource Builder: mulai siklus semua village")
+        // Reset watchdog saat masuk fase Builder agar timeout Farm List tidak
+        // mematikan Builder yang memang membutuhkan waktu lebih dari 1 menit.
+        handler.removeCallbacks(cycleWatchdogRunnable)
+        handler.postDelayed(cycleWatchdogRunnable, 5 * 60_000L)
         automationWebView()?.loadUrl("$server/dorf1.php")
     }
 

@@ -55,6 +55,10 @@ class MainActivity : Activity() {
         val ironCap: Int = -1,
         val crop: Int = -1,
         val cropCap: Int = -1,
+        val woodProd: Int = -1,
+        val clayProd: Int = -1,
+        val ironProd: Int = -1,
+        val cropProd: Int = -1,
         val updatedAt: String = "--"
     )
 
@@ -1153,6 +1157,7 @@ class MainActivity : Activity() {
                 const resourcesObject = (typeof window.resources === 'object' && window.resources) ? window.resources : null;
                 const storage = resourcesObject?.storage || {};
                 const maxStorage = resourcesObject?.maxStorage || {};
+                const production = resourcesObject?.production || {};
                 const resources = {};
 
                 const numberFromText = value => {
@@ -1164,6 +1169,7 @@ class MainActivity : Activity() {
                     const el = document.getElementById(rid);
                     const direct = storage[rid];
                     const directMax = maxStorage[rid];
+                    const directProduction = production[rid];
                     let current = Number.isFinite(Number(direct)) ? Number(direct) : NaN;
                     let capacity = Number.isFinite(Number(directMax)) ? Number(directMax) : NaN;
 
@@ -1193,7 +1199,8 @@ class MainActivity : Activity() {
                     return {
                         text: el?.textContent || '',
                         current: Number.isFinite(current) ? String(Math.trunc(current)) : '',
-                        capacity: Number.isFinite(capacity) ? String(Math.trunc(capacity)) : ''
+                        capacity: Number.isFinite(capacity) ? String(Math.trunc(capacity)) : '',
+                        production: Number.isFinite(Number(directProduction)) ? String(Math.trunc(Number(directProduction))) : ''
                     };
                 };
 
@@ -1317,12 +1324,23 @@ class MainActivity : Activity() {
         val clay = pair("l2")
         val iron = pair("l3")
         val crop = pair("l4")
+        fun production(key: String): Int {
+            debugTrace("ENTER production")
+            val item = resources?.optJSONObject(key) ?: return -1
+            return item.optString("production", "").replace(".", "").replace(",", "").toIntOrNull() ?: -1
+        }
+        val woodProd = production("l1")
+        val clayProd = production("l2")
+        val ironProd = production("l3")
+        val cropProd = production("l4")
         resourceSnapshots[id] = ResourceSnapshot(
             villageId = id, villageName = name,
             wood = wood.first, woodCap = wood.second,
             clay = clay.first, clayCap = clay.second,
             iron = iron.first, ironCap = iron.second,
             crop = crop.first, cropCap = crop.second,
+            woodProd = woodProd, clayProd = clayProd,
+            ironProd = ironProd, cropProd = cropProd,
             updatedAt = timeFormat.format(Date())
         )
         saveResourceSnapshots()
@@ -2134,6 +2152,8 @@ class MainActivity : Activity() {
                 clay = o.optInt("clay", -1), clayCap = o.optInt("clayCap", -1),
                 iron = o.optInt("iron", -1), ironCap = o.optInt("ironCap", -1),
                 crop = o.optInt("crop", -1), cropCap = o.optInt("cropCap", -1),
+                woodProd = o.optInt("woodProd", -1), clayProd = o.optInt("clayProd", -1),
+                ironProd = o.optInt("ironProd", -1), cropProd = o.optInt("cropProd", -1),
                 updatedAt = o.optString("updatedAt", "--")
             )
         }
@@ -2151,6 +2171,8 @@ class MainActivity : Activity() {
                     put("clay", d.clay); put("clayCap", d.clayCap)
                     put("iron", d.iron); put("ironCap", d.ironCap)
                     put("crop", d.crop); put("cropCap", d.cropCap)
+                    put("woodProd", d.woodProd); put("clayProd", d.clayProd)
+                    put("ironProd", d.ironProd); put("cropProd", d.cropProd)
                     put("updatedAt", d.updatedAt)
                 })
             }
@@ -2228,10 +2250,10 @@ class MainActivity : Activity() {
                 setTypeface(null, android.graphics.Typeface.BOLD)
             }
             card.addView(title)
-            card.addView(resourceLine("🌲 Kayu", data.wood, data.woodCap))
-            card.addView(resourceLine("🧱 Liat", data.clay, data.clayCap))
-            card.addView(resourceLine("⚙️ Besi", data.iron, data.ironCap))
-            card.addView(resourceLine("🌾 Gandum", data.crop, data.cropCap))
+            card.addView(resourceLine("🌲 Kayu", data.wood, data.woodCap, data.woodProd))
+            card.addView(resourceLine("🧱 Liat", data.clay, data.clayCap, data.clayProd))
+            card.addView(resourceLine("⚙️ Besi", data.iron, data.ironCap, data.ironProd))
+            card.addView(resourceLine("🌾 Gandum", data.crop, data.cropCap, data.cropProd))
             val updated = TextView(this).apply {
                 text = "Update: ${data.updatedAt}"
                 textSize = 11f
@@ -2242,15 +2264,31 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun resourceLine(label: String, current: Int, capacity: Int): TextView {
+    private fun resourceLine(label: String, current: Int, capacity: Int, production: Int): View {
         debugTrace("ENTER resourceLine")
         val pct = percent(current, capacity)
-        return TextView(this).apply {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = android.view.Gravity.CENTER_VERTICAL
+            setPadding(0, 3, 0, 3)
+            layoutParams = LinearLayout.LayoutParams(-1, -2)
+        }
+        val left = TextView(this).apply {
             text = if (pct >= 0) "$label   $current / $capacity   $pct%" else "$label   data belum terbaca"
             textSize = 14f
             setTextColor(if (pct >= 90) Color.YELLOW else Color.WHITE)
-            setPadding(0, 4, 0, 4)
+            layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
         }
+        val right = TextView(this).apply {
+            text = if (production >= 0) "${if (production >= 0) "+" else ""}$production/jam" else "--/jam"
+            textSize = 13f
+            setTextColor(Color.LTGRAY)
+            gravity = android.view.Gravity.END
+            layoutParams = LinearLayout.LayoutParams(-2, -2)
+        }
+        row.addView(left)
+        row.addView(right)
+        return row
     }
 
     private fun refreshLogOverview() {
