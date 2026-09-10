@@ -942,7 +942,7 @@ class FarmAutomationService : Service() {
                 const norm = s => (s || '').replace(/\s+/g,' ').trim().toLowerCase();
                 const root = document.querySelector('#build, #villageContent, #content') || document.body;
                 const current = [
-                    '#l4', '#l3', '#l2', '#l1'
+                    '#l1', '#l2', '#l3', '#l4'
                 ].map(sel => {
                     const el = document.querySelector(sel);
                     const text = el ? (el.innerText || el.textContent || el.getAttribute('title') || '') : '';
@@ -987,16 +987,29 @@ class FarmAutomationService : Service() {
                     }
                 }
 
-                if (costs.some(x => x <= 0)) return JSON.stringify({state:'costs_unknown', current, costs});
-
                 const all = [...root.querySelectorAll('button,a,input[type=submit],input[type=button],[role=button]')];
                 const candidates = all.filter(el => visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
                 const btn = candidates.find(el => {
                     const text = norm(el.innerText || el.textContent || el.value || el.title || el.getAttribute('aria-label'));
                     const cls = (el.className || '').toString().toLowerCase();
-                    return /upgrade|upgrade to level|build/.test(text) && !/cancel|demolish|destroy/.test(text) && !/disabled/.test(cls);
-                }) || candidates.find(el => /green/.test((el.className || '').toString().toLowerCase()) && /build|upgrade/.test((el.className || '').toString().toLowerCase()));
+                    const href = (el.getAttribute('href') || '').toLowerCase();
+                    if (/cancel|demolish|destroy|remove/.test(text + ' ' + cls)) return false;
+                    return /upgrade|upgrade to level|build/.test(text) ||
+                           /(?:^|\s)(green|build|upgrade)(?:\s|$)/.test(cls) ||
+                           /build\.php/.test(href);
+                }) || candidates.find(el => {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    return /green/.test(cls) && /build|upgrade/.test(cls);
+                });
 
+                // Jika tombol Upgrade sudah enabled, Travian sendiri sudah menyatakan
+                // bahwa resource cukup. Jangan menggagalkan upgrade hanya karena parser
+                // biaya gagal membaca markup versi tertentu.
+                if (btn && costs.some(x => x <= 0)) {
+                    return JSON.stringify({state:'ready_button', current, costs, deficit:[0,0,0,0]});
+                }
+
+                if (costs.some(x => x <= 0)) return JSON.stringify({state:'costs_unknown', current, costs});
                 if (!btn) return JSON.stringify({state:'not_found', current, costs});
                 const deficit = costs.map((c,i) => Math.max(0, c - current[i]));
                 return JSON.stringify({state:'ready', current, costs, deficit});
@@ -1009,6 +1022,10 @@ class FarmAutomationService : Service() {
             val costMatch = Regex("\\\"costs\\\":\\[(.*?)\\]").find(result)
             val costs = costMatch?.groupValues?.get(1)?.split(',')?.mapNotNull { it.trim().toLongOrNull() } ?: emptyList()
             when {
+                result.contains("ready_button") -> {
+                    logEvent("Resource Builder: tombol upgrade tersedia, langsung menjalankan upgrade di ${builderVillages.getOrNull(builderVillageIndex)?.second ?: "village ${builderVillageIndex + 1}"}")
+                    clickResourceUpgrade()
+                }
                 result.contains("costs_unknown") -> {
                     if (builderAttempt < 5) {
                         builderAttempt++
@@ -1201,8 +1218,15 @@ class FarmAutomationService : Service() {
                 const btn = candidates.find(el => {
                     const text = norm(el.innerText || el.textContent || el.value || el.title || el.getAttribute('aria-label'));
                     const cls = (el.className || '').toString().toLowerCase();
-                    return /upgrade|upgrade to level|build/.test(text) && !/cancel|demolish|destroy/.test(text) && !/disabled/.test(cls);
-                }) || candidates.find(el => /green/.test((el.className || '').toString().toLowerCase()) && /build|upgrade/.test((el.className || '').toString().toLowerCase()));
+                    const href = (el.getAttribute('href') || '').toLowerCase();
+                    if (/cancel|demolish|destroy|remove/.test(text + ' ' + cls)) return false;
+                    return /upgrade|upgrade to level|build/.test(text) ||
+                           /(?:^|\s)(green|build|upgrade)(?:\s|$)/.test(cls) ||
+                           /build\.php/.test(href);
+                }) || candidates.find(el => {
+                    const cls = (el.className || '').toString().toLowerCase();
+                    return /green/.test(cls) && /build|upgrade/.test(cls);
+                });
                 if (!btn) return 'not-found';
                 btn.scrollIntoView({block:'center'}); btn.click(); return 'clicked:' + (btn.innerText || btn.value || 'upgrade');
             })();
