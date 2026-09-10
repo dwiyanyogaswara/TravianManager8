@@ -178,11 +178,6 @@
                         android:gravity="center_vertical"
                         android:layout_width="match_parent"
                         android:layout_height="68dp"/>
-                    <Button
-                        android:id="@+id/openFarm"
-                        android:text="BUKA FARM LIST"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"/>
                 </LinearLayout>
             </ScrollView>
             <LinearLayout
