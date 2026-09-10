@@ -38,8 +38,8 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var lastRun: TextView
     private lateinit var nextRun: TextView
-    private lateinit var farmListCycleTime: TextView
-    private lateinit var resourceBuilderCycleTime: TextView
+    private lateinit var farmCycleTime: TextView
+    private lateinit var resourceCycleTime: TextView
     private lateinit var serverInput: EditText
     private lateinit var usernameInput: EditText
     private lateinit var passwordInput: EditText
@@ -172,8 +172,8 @@ class MainActivity : Activity() {
         status = findViewById(R.id.status)
         lastRun = findViewById(R.id.lastRun)
         nextRun = findViewById(R.id.nextRun)
-        farmListCycleTime = findViewById(R.id.farmListCycleTime)
-        resourceBuilderCycleTime = findViewById(R.id.resourceBuilderCycleTime)
+        farmCycleTime = findViewById(R.id.farmCycleTime)
+        resourceCycleTime = findViewById(R.id.resourceCycleTime)
         webView = findViewById(R.id.webView)
         pruneLogs()
         handler.postDelayed(logCleanup, 60 * 60 * 1000L)
@@ -246,8 +246,15 @@ class MainActivity : Activity() {
                 installLiveClickLogger(url)
                 logEvent("LIVE PAGE FINISHED: $url")
 
-                // LOAD VILLAGE memiliki prioritas atas scheduler/service agar WebView
-                // benar-benar dipakai untuk scan village satu per satu.
+                // Saat background service aktif, WebView Live adalah milik automation.
+                // Forward event halaman terlebih dahulu agar Resource Builder tidak
+                // tertahan oleh scanner UI.
+                if (FarmAutomationService.isRunningFromService()) {
+                    FarmAutomationService.forwardPageFinished(url)
+                    return
+                }
+
+                // LOAD VILLAGE hanya berjalan ketika background service tidak aktif.
                 if (villageScanActive) {
                     // Satu onPageFinished bisa terpanggil beberapa kali (redirect/hash/consent).
                     // Jangan menembakkan evaluateJavascript scan berulang secara bersamaan.
@@ -260,11 +267,6 @@ class MainActivity : Activity() {
                             collectVillageTargetsFromSidebar()
                         }
                     }, 900)
-                    return
-                }
-
-                if (FarmAutomationService.isRunningFromService()) {
-                    FarmAutomationService.forwardPageFinished(url)
                     return
                 }
 
@@ -744,6 +746,42 @@ class MainActivity : Activity() {
         logEvent("LIVE DEBUG: memasang logger klik; page=$pageUrl")
     }
 
+    private fun clearSavedResourceBuilderTargets() {
+        debugTrace("ENTER clearSavedResourceBuilderTargets")
+        getSharedPreferences("config", MODE_PRIVATE).edit()
+            .putString("resource_builder_targets_json", "{}")
+            .apply()
+        logEvent("UI: target resource tersimpan direset; scanner akan mencari ulang level terendah")
+    }
+
+    private fun saveResourceBuilderTarget(
+        villageId: String,
+        villageName: String,
+        level: Int,
+        fieldId: String,
+        href: String
+    ) {
+        debugTrace("ENTER saveResourceBuilderTarget")
+        val cleanHref = href.trim()
+        if (villageId.isBlank() || cleanHref.isBlank()) return
+        val prefs = getSharedPreferences("config", MODE_PRIVATE)
+        val obj = runCatching { JSONObject(prefs.getString("resource_builder_targets_json", "{}").orEmpty()) }
+            .getOrElse { JSONObject() }
+        obj.put(villageId, JSONObject().apply {
+            put("id", villageId)
+            put("name", villageName)
+            put("level", level)
+            put("fieldId", fieldId)
+            put("href", cleanHref)
+            put("savedAt", System.currentTimeMillis())
+        })
+        prefs.edit().putString("resource_builder_targets_json", obj.toString()).apply()
+        logEvent(
+            "UI: TARGET RESOURCE tersimpan — $villageName [${villageId}] " +
+                "L$level field=$fieldId href=$cleanHref"
+        )
+    }
+
     private fun refreshVillagesForUi() {
         debugTrace("ENTER refreshVillagesForUi")
         villageScanActive = true
@@ -758,6 +796,7 @@ class MainActivity : Activity() {
         villageScanScrollPass = 0
         villageScanCollectedTargets.clear()
         villageScanCollectInFlight = false
+        clearSavedResourceBuilderTargets()
 
         farmStatus.text = "Refresh village: membaca daftar village..."
         logEvent("UI: REFRESH VILLAGE → membuka dorf1.php")
@@ -1155,6 +1194,41 @@ class MainActivity : Activity() {
                 const levels = fields.filter(n => Number.isFinite(n));
                 const uniqueLevels = levels.slice(0, 18);
 
+                // Simpan LINK field dengan level terendah. Ini menjadi target yang
+                // dipakai Resource Builder saat eksekusi berikutnya. Link diambil
+                // langsung dari anchor field agar id/link tetap spesifik ke village.
+                const resourceAnchors = container
+                    ? [...container.querySelectorAll('a[href*="build.php?id="]')]
+                    : [];
+                const resourceCandidates = [];
+                const seenResourceIds = new Set();
+                for (const a of resourceAnchors) {
+                    const href = a.getAttribute('href') || '';
+                    const m = href.match(/[?&]id=(\d+)/i);
+                    if (!m || seenResourceIds.has(m[1])) continue;
+                    const fieldId = parseInt(m[1], 10);
+                    if (!Number.isFinite(fieldId) || fieldId < 1 || fieldId > 18) continue;
+                    seenResourceIds.add(m[1]);
+                    let level = -1;
+                    let node = a;
+                    for (let depth = 0; depth < 8 && node; depth++, node = node.parentElement) {
+                        const text = clean(node.innerText || node.textContent || '');
+                        const attrs = [
+                            node.getAttribute?.('data-level') || '',
+                            node.getAttribute?.('title') || '',
+                            node.getAttribute?.('aria-label') || '',
+                            String(node.className || '')
+                        ].join(' ');
+                        const lm = text.match(/(?:level|lvl)\s*(\d+)/i) || attrs.match(/level\s*(\d+)/i);
+                        if (lm) { level = parseInt(lm[1], 10); break; }
+                    }
+                    const disabled = a.classList.contains('disabled') || !!a.closest('.disabled') ||
+                        a.getAttribute('aria-disabled') === 'true' || a.getAttribute('data-disabled') === 'true';
+                    resourceCandidates.push({fieldId, level, href, disabled});
+                }
+                resourceCandidates.sort((a,b) => a.level - b.level || a.fieldId - b.fieldId);
+                const lowestResource = resourceCandidates.find(x => !x.disabled && x.level >= 0 && x.level < 10) || null;
+
                 // RESOURCE BAR: Travian Legends memakai l1=wood, l2=clay,
                 // l3=iron, l4=crop. Sumber paling stabil adalah object window.resources
                 // yang dipakai UI Travian sendiri; fallback membaca #stockBar.
@@ -1222,7 +1296,7 @@ class MainActivity : Activity() {
                         notReady:true, reason:'FIELDS_NOT_READY', id:currentId, expectedId,
                         url, activeId, activeName, fieldCount:uniqueLevels.length,
                         resourceComplete, resourceContainer:!!container, resources,
-                        debugFields:debugFields.slice(0,12)
+                        lowestResource, debugFields:debugFields.slice(0,12)
                     }));
                     return;
                 }
@@ -1238,7 +1312,7 @@ class MainActivity : Activity() {
                     id:expectedId, name:pageName, minLevel:Math.min(...uniqueLevels),
                     fields:uniqueLevels, fieldNodeCount:fieldNodes.length,
                     debugFieldCount:debugFields.length, debugFields,
-                    resourceContainer:true, activeId, activeName, url, resources
+                    resourceContainer:true, activeId, activeName, url, resources, lowestResource
                 }));
             })();
         """.trimIndent()
@@ -1297,6 +1371,10 @@ class MainActivity : Activity() {
         val activeName = json?.optString("activeName", "").orEmpty()
         val fieldNodeCount = json?.optInt("fieldNodeCount", 0) ?: 0
         val resourceContainer = json?.optBoolean("resourceContainer", false) == true
+        val lowestResource = json?.optJSONObject("lowestResource")
+        val lowestResourceLevel = lowestResource?.optInt("level", -1) ?: -1
+        val lowestResourceId = lowestResource?.optString("fieldId", "").orEmpty()
+        val lowestResourceHref = lowestResource?.optString("href", "").orEmpty()
 
         villageMinLevels[id] = minLevel
 
@@ -1348,6 +1426,11 @@ class MainActivity : Activity() {
             updatedAt = timeFormat.format(Date())
         )
         saveResourceSnapshots()
+        if (lowestResource != null && lowestResourceHref.isNotBlank() && lowestResourceLevel >= 0) {
+            saveResourceBuilderTarget(id, name, lowestResourceLevel, lowestResourceId, lowestResourceHref)
+        } else {
+            logEvent("UI: [$progress] target resource level terendah tidak ditemukan untuk $name")
+        }
         if (wood.first < 0 || clay.first < 0 || iron.first < 0 || crop.first < 0) {
             logEvent("UI: [$progress] resource belum lengkap — wood=$wood; clay=$clay; iron=$iron; crop=$crop")
         }
@@ -1947,18 +2030,17 @@ class MainActivity : Activity() {
         }
 
         @JavascriptInterface
+        fun onLiveClickResult(result: String) {
+            debugTrace("ENTER onLiveClickResult")
+            runOnUiThread { handleLiveClickResult(result) }
+        }
+
+        @JavascriptInterface
         fun onVillageListResult(result: String) {
             debugTrace("ENTER onVillageListResult")
             if (FarmAutomationService.isRunningFromService()) {
                 FarmAutomationService.forwardVillageListResult(result)
-                return
             }
-        }
-
-        @JavascriptInterface
-        fun onLiveClickResult(result: String) {
-            debugTrace("ENTER onLiveClickResult")
-            runOnUiThread { handleLiveClickResult(result) }
         }
 
         @JavascriptInterface
@@ -2356,32 +2438,32 @@ class MainActivity : Activity() {
         return out
     }
 
-    private fun formatDuration(durationMs: Long): String {
-        val totalSeconds = (durationMs / 1000L).coerceAtLeast(0L)
+    private fun formatDuration(ms: Long): String {
+        val totalSeconds = (ms.coerceAtLeast(0L) / 1000L)
         val hours = totalSeconds / 3600L
         val minutes = (totalSeconds % 3600L) / 60L
         val seconds = totalSeconds % 60L
         return String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
     }
 
+    private fun updateCycleTimes(prefs: android.content.SharedPreferences) {
+        val now = System.currentTimeMillis()
+        val farmStart = prefs.getLong("farm_cycle_started_at", 0L)
+        val resourceStart = prefs.getLong("resource_cycle_started_at", 0L)
+        val farmDuration = if (farmStart > 0L) now - farmStart else prefs.getLong("farm_cycle_duration_ms", 0L)
+        val resourceDuration = if (resourceStart > 0L) now - resourceStart else prefs.getLong("resource_cycle_duration_ms", 0L)
+        farmCycleTime.text = "Waktu Siklus Farm List: ${formatDuration(farmDuration)}"
+        resourceCycleTime.text = "Waktu Siklus Resource Builder: ${formatDuration(resourceDuration)}"
+    }
+
     private fun updateCountdown() {
         debugTrace("ENTER updateCountdown")
         val prefs = getSharedPreferences("config", MODE_PRIVATE)
+        updateCycleTimes(prefs)
         val serviceRunning = prefs.getBoolean("service_running", false)
         val next = prefs.getLong("next_run_at", 0L)
         val last = prefs.getString("last_run", "").orEmpty()
         lastRun.text = if (last.isBlank()) "Last run: --" else "Last run: $last"
-
-        val farmStart = prefs.getLong("farm_list_cycle_started_at", 0L)
-        val farmSaved = prefs.getLong("farm_list_cycle_duration_ms", 0L)
-        val builderStart = prefs.getLong("resource_builder_cycle_started_at", 0L)
-        val builderSaved = prefs.getLong("resource_builder_cycle_duration_ms", 0L)
-        val nowMs = System.currentTimeMillis()
-        val farmDuration = if (farmStart > 0L) (nowMs - farmStart).coerceAtLeast(0L) else farmSaved
-        val builderDuration = if (builderStart > 0L) (nowMs - builderStart).coerceAtLeast(0L) else builderSaved
-        farmListCycleTime.text = "Waktu Siklus Farm List: ${formatDuration(farmDuration)}"
-        resourceBuilderCycleTime.text = "Waktu Siklus Resource Builder: ${formatDuration(builderDuration)}"
-
         if (!serviceRunning) {
             nextRun.text = "Next run: --"
             return

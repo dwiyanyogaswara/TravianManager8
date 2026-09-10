@@ -112,30 +112,11 @@ class FarmAutomationService : Service() {
     private var minMinutes = 1L
     private var maxMinutes = 1L
     private var nextAt = 0L
-    private var farmListCycleStartedAt = 0L
-    private var resourceBuilderCycleStartedAt = 0L
     private val cycleWatchdogRunnable = Runnable {
         if (!running) return@Runnable
+        val now = System.currentTimeMillis()
+        persistActiveCycleDuration(now)
         logEvent("WATCHDOG: fase siklus berjalan >5 menit — proses aktif diakhiri agar scheduler tidak stuck")
-        val watchdogNow = System.currentTimeMillis()
-        if (farmListCycleStartedAt > 0L) {
-            val duration = (watchdogNow - farmListCycleStartedAt).coerceAtLeast(0L)
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putLong("farm_list_cycle_duration_ms", duration)
-                .putLong("farm_list_cycle_started_at", 0L)
-                .apply()
-            logEvent("Farm List: waktu proses ${formatDuration(duration)} (watchdog)")
-            farmListCycleStartedAt = 0L
-        }
-        if (resourceBuilderCycleStartedAt > 0L) {
-            val duration = (watchdogNow - resourceBuilderCycleStartedAt).coerceAtLeast(0L)
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putLong("resource_builder_cycle_duration_ms", duration)
-                .putLong("resource_builder_cycle_started_at", 0L)
-                .apply()
-            logEvent("Resource Builder: waktu proses ${formatDuration(duration)} (watchdog)")
-            resourceBuilderCycleStartedAt = 0L
-        }
         pendingStartAll = false
         builderInProgress = false
         loginInProgress = false
@@ -155,10 +136,21 @@ class FarmAutomationService : Service() {
     private var builderVillages = mutableListOf<Pair<String, String>>()
     private var builderVillageIndex = 0
     private var builderAttempt = 0
+
+    // Target resource disimpan saat scanner UI mencari level terendah.
+    // Resource Builder tidak lagi menebak field dari halaman village ketika eksekusi;
+    // ia memakai href yang sudah disimpan untuk village tersebut.
+    private val builderResourceLinks = linkedMapOf<String, String>()
+    private val builderResourceLevels = linkedMapOf<String, Int>()
+    private var pendingBuilderResourceHref = ""
+    private var builderVillageClickInProgress = false
+
     private var pendingUpgradeUrl = ""
     private var pendingUpgradeCosts = longArrayOf(0L, 0L, 0L, 0L)
     private var inventoryUseAttempt = 0
     private var cycleNumber = 0
+    private var farmListCycleStartedAt = 0L
+    private var resourceBuilderCycleStartedAt = 0L
     private var recoveringService = false
     private var webViewRecoveryInProgress = false
     private var lastAutomationUrl = ""
@@ -196,6 +188,7 @@ class FarmAutomationService : Service() {
                     ?: (getSharedPreferences(PREFS, MODE_PRIVATE).getStringSet("resource_builder_selected_villages", emptySet()) ?: emptySet())
                 selectedBuilderVillagesJson = intent.getStringExtra(EXTRA_SELECTED_VILLAGES_JSON)
                     ?: getSharedPreferences(PREFS, MODE_PRIVATE).getString("resource_builder_villages_json", "[]").orEmpty()
+                loadSavedBuilderResourceTargets()
                 startAutomation()
             }
             null -> recoverAfterProcessRecreation()
@@ -220,7 +213,10 @@ class FarmAutomationService : Service() {
         builderSelectionConfigured = prefs.getBoolean("resource_builder_selection_configured", false)
         selectedBuilderVillageIds = prefs.getStringSet("resource_builder_selected_villages", emptySet()) ?: emptySet()
         selectedBuilderVillagesJson = prefs.getString("resource_builder_villages_json", "[]").orEmpty()
+        loadSavedBuilderResourceTargets(prefs)
         cycleNumber = prefs.getInt("current_cycle_number", 0)
+        farmListCycleStartedAt = prefs.getLong("farm_cycle_started_at", 0L)
+        resourceBuilderCycleStartedAt = prefs.getLong("resource_cycle_started_at", 0L)
 
         if (username.isBlank()) {
             logEvent("RECOVERY: service ditandai aktif tetapi username kosong; recovery dibatalkan")
@@ -384,15 +380,14 @@ class FarmAutomationService : Service() {
         if (!running) return
         val now = timeFormat.format(Date())
         cycleNumber += 1
-        val cycleStartMs = System.currentTimeMillis()
-        farmListCycleStartedAt = if (farmListEnabled) cycleStartMs else 0L
+        farmListCycleStartedAt = if (farmListEnabled) System.currentTimeMillis() else 0L
         resourceBuilderCycleStartedAt = 0L
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putString("last_run", now)
             .putInt("current_cycle_number", cycleNumber)
             .putBoolean("cycle_active", true)
-            .putLong("farm_list_cycle_started_at", farmListCycleStartedAt)
-            .putLong("resource_builder_cycle_started_at", 0L)
+            .putLong("farm_cycle_started_at", farmListCycleStartedAt)
+            .putLong("resource_cycle_started_at", 0L)
             .apply()
         logEvent("Siklus dimulai pada $now")
         handler.removeCallbacks(cycleWatchdogRunnable)
@@ -448,8 +443,16 @@ class FarmAutomationService : Service() {
             if (builderInProgress && lower.contains("dorf1.php")) {
                 if (builderVillages.isEmpty()) {
                     handler.postDelayed({ discoverVillagesForBuilder() }, 700)
+                } else if (builderVillageClickInProgress && pendingBuilderResourceHref.isNotBlank()) {
+                    // Setelah klik village, halaman dorf1?newdid=... selesai dimuat.
+                    // Baru sekarang buka href resource yang sudah disimpan.
+                    if (lower.contains("newdid=")) {
+                        handler.postDelayed({ openSavedBuilderResource() }, 700)
+                    } else {
+                        handler.postDelayed({ clickBuilderVillageFromDorf() }, 500)
+                    }
                 } else {
-                    handler.postDelayed({ inspectResourceVillage() }, 700)
+                    handler.postDelayed({ processResourceBuilderVillage() }, 500)
                 }
                 return@acceptCookiesIfPresent
             }
@@ -840,27 +843,27 @@ class FarmAutomationService : Service() {
     private fun startResourceBuilderCycle() {
         debugTrace("ENTER startResourceBuilderCycle")
         if (!running) return
-
-        val nowMs = System.currentTimeMillis()
-        if (farmListCycleStartedAt > 0L) {
-            val farmDuration = (nowMs - farmListCycleStartedAt).coerceAtLeast(0L)
-            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putLong("farm_list_cycle_duration_ms", farmDuration)
-                .putLong("farm_list_cycle_started_at", 0L)
-                .apply()
-            logEvent("Farm List: waktu proses ${formatDuration(farmDuration)}")
-            farmListCycleStartedAt = 0L
-        }
-
-        resourceBuilderCycleStartedAt = nowMs
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putLong("resource_builder_cycle_started_at", resourceBuilderCycleStartedAt)
-            .apply()
-
         builderInProgress = true
         builderVillages.clear()
         builderVillageIndex = 0
         builderAttempt = 0
+        pendingBuilderResourceHref = ""
+        builderVillageClickInProgress = false
+        loadSavedBuilderResourceTargets()
+        val now = System.currentTimeMillis()
+        if (farmListCycleStartedAt > 0L) {
+            val farmDuration = (now - farmListCycleStartedAt).coerceAtLeast(0L)
+            getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+                .putLong("farm_cycle_duration_ms", farmDuration)
+                .putLong("farm_cycle_started_at", 0L)
+                .apply()
+            logEvent("Farm List: waktu proses ${formatDuration(farmDuration)}")
+            farmListCycleStartedAt = 0L
+        }
+        resourceBuilderCycleStartedAt = now
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
+            .putLong("resource_cycle_started_at", now)
+            .apply()
         updateNotification("Farm Assistant — Resource Builder menyiapkan village")
         logEvent("Resource Builder: mulai siklus semua village")
         // Reset watchdog saat masuk fase Builder agar timeout Farm List tidak
@@ -877,11 +880,148 @@ class FarmAutomationService : Service() {
             finishResourceBuilderCycle()
             return
         }
+
         val (villageId, villageName) = builderVillages[builderVillageIndex]
+        val resourceHref = builderResourceLinks[villageId].orEmpty()
+        if (resourceHref.isBlank()) {
+            logEvent("Resource Builder: target resource belum tersimpan untuk $villageName (ID $villageId); village dilewati. Jalankan REFRESH VILLAGE terlebih dahulu.")
+            goToNextBuilderVillage()
+            return
+        }
+
         builderAttempt = 0
-        logEvent("Resource Builder: village ${builderVillageIndex + 1}/${builderVillages.size} — $villageName (ID $villageId)")
+        pendingBuilderResourceHref = resourceHref
+        builderVillageClickInProgress = true
+        val savedLevel = builderResourceLevels[villageId]
+        logEvent(
+            "Resource Builder: village ${builderVillageIndex + 1}/${builderVillages.size} — $villageName (ID $villageId); " +
+                "target=${resourceHref}${savedLevel?.let { "; level=L$it" } ?: ""}"
+        )
         updateNotification("Resource Builder — ${builderVillageIndex + 1}/${builderVillages.size}: $villageName")
-        automationWebView()?.loadUrl("$server/dorf1.php?newdid=$villageId")
+
+        // Selalu kembali ke dorf1.php. Dari sana bot benar-benar klik village yang
+        // dicentang, baru setelah halaman village terbuka mengikuti href resource
+        // yang sudah disimpan saat pencarian level terendah.
+        automationWebView()?.loadUrl("$server/dorf1.php")
+    }
+
+    private fun openSavedBuilderResource() {
+        debugTrace("ENTER openSavedBuilderResource")
+        if (!running || !builderInProgress || pendingBuilderResourceHref.isBlank()) return
+        val (villageId, villageName) = builderVillages.getOrNull(builderVillageIndex)
+            ?: return
+        val expectedId = villageId
+        val href = pendingBuilderResourceHref
+        val hrefJson = JSONObject.quote(href)
+        val idJson = JSONObject.quote(expectedId)
+
+        val js = """
+            (() => {
+                const id = $idJson;
+                const targetHref = $hrefJson;
+                const current = location.href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                if (current !== id) return JSON.stringify({state:'wrong_village', current, expected:id});
+
+                // Pastikan target href yang tersimpan memang berasal dari village ini.
+                const anchors = [...document.querySelectorAll('#resourceFieldContainer a[href*="build.php?id="], a[href*="build.php?id="]')];
+                const wanted = targetHref.split('#')[0];
+                const found = anchors.find(a => {
+                    const raw = a.getAttribute('href') || '';
+                    return raw === targetHref || raw === wanted || a.href === targetHref || a.href === wanted;
+                });
+
+                if (found) {
+                    found.scrollIntoView({block:'center'});
+                    found.click();
+                    return JSON.stringify({state:'clicked', href:found.getAttribute('href') || found.href});
+                }
+
+                // Jika skin Travian tidak merender anchor resource di DOM, gunakan
+                // href tersimpan secara langsung. Ini tetap menuju field yang sama.
+                location.href = targetHref;
+                return JSON.stringify({state:'load_saved_href', href:targetHref});
+            })();
+        """.trimIndent()
+
+        automationWebView()?.evaluateJavascript(js) { raw ->
+            val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
+            when {
+                result.contains("wrong_village") -> {
+                    logEvent("Resource Builder: village aktif salah saat membuka target; expected=$expectedId; retry")
+                    if (builderAttempt < 4) {
+                        builderAttempt++
+                        automationWebView()?.loadUrl("$server/dorf1.php")
+                    } else {
+                        builderVillageClickInProgress = false
+                        pendingBuilderResourceHref = ""
+                        goToNextBuilderVillage()
+                    }
+                }
+                result.contains("clicked") || result.contains("load_saved_href") -> {
+                    builderVillageClickInProgress = false
+                    logEvent("Resource Builder: $villageName — membuka target resource tersimpan $href")
+                }
+                else -> {
+                    if (builderAttempt < 4) {
+                        builderAttempt++
+                        handler.postDelayed({ openSavedBuilderResource() }, 700)
+                    } else {
+                        builderVillageClickInProgress = false
+                        pendingBuilderResourceHref = ""
+                        logEvent("Resource Builder: gagal membuka target resource tersimpan untuk $villageName")
+                        goToNextBuilderVillage()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun clickBuilderVillageFromDorf() {
+        debugTrace("ENTER clickBuilderVillageFromDorf")
+        if (!running || !builderInProgress || !builderVillageClickInProgress) return
+        val village = builderVillages.getOrNull(builderVillageIndex) ?: return
+        val idJson = JSONObject.quote(village.first)
+        val nameJson = JSONObject.quote(village.second)
+        val js = """
+            (() => {
+                const id = $idJson;
+                const name = $nameJson;
+                const clean = s => String(s || '').replace(/\s+/g,' ').trim();
+                const anchors = [...document.querySelectorAll('a')];
+                let anchor = null;
+                for (const a of anchors) {
+                    const entry = a.closest('.listEntry, .dropContainer, li');
+                    const dataDid = a.getAttribute('data-did') || entry?.getAttribute('data-did') || '';
+                    const href = a.getAttribute('href') || '';
+                    const hrefDid = href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                    if ((dataDid === id || hrefDid === id) && !/build\.php/i.test(href)) { anchor = a; break; }
+                }
+                if (!anchor) return 'not-found';
+                anchor.scrollIntoView({block:'center', inline:'nearest'});
+                anchor.click();
+                // Beberapa skin memakai href="#" dan navigasi dilakukan oleh
+                // handler Travian. Jika handler gagal, fallback ke URL village.
+                setTimeout(() => {
+                    const current = location.href.match(/[?&]newdid=(\d+)/i)?.[1] || '';
+                    if (current !== id) location.href = '/dorf1.php?newdid=' + encodeURIComponent(id);
+                }, 2200);
+                return 'clicked';
+            })();
+        """.trimIndent()
+        automationWebView()?.evaluateJavascript(js) { raw ->
+            val result = raw.orEmpty().trim('"')
+            if (result == "clicked") {
+                logEvent("Resource Builder: klik village ${village.second} (ID ${village.first}) dari dorf1.php")
+            } else if (builderAttempt < 5) {
+                builderAttempt++
+                handler.postDelayed({ clickBuilderVillageFromDorf() }, 700)
+            } else {
+                logEvent("Resource Builder: link village ${village.second} (ID ${village.first}) tidak ditemukan di dorf1.php")
+                builderVillageClickInProgress = false
+                pendingBuilderResourceHref = ""
+                goToNextBuilderVillage()
+            }
+        }
     }
 
     private fun inspectResourceVillage() {
@@ -904,27 +1044,26 @@ class FarmAutomationService : Service() {
                 }
 
                 const fields = [];
+                // Travian's resource field map normally contains 18 direct anchors.
+                // Avoid depending on a skin-specific wrapper/class.
                 const anchors = [...container.querySelectorAll('a[href*="build.php?id="]')];
                 const seen = new Set();
                 for (const a of anchors) {
                     const href = a.getAttribute('href') || '';
                     const m = href.match(/[?&]id=(\d+)/);
-                    if (!m || seen.has(m[1])) continue;
+                    if (!m) continue;
+                    const idNum = parseInt(m[1], 10);
+                    if (idNum < 1 || idNum > 18 || seen.has(m[1])) continue;
                     seen.add(m[1]);
                     let level = 0;
                     let node = a;
-                    for (let i=0; i<5 && node; i++, node=node.parentElement) {
+                    for (let i=0; i<7 && node; i++, node=node.parentElement) {
                         const text = norm(node.innerText || node.textContent || '');
-                        const lm = text.match(/(?:level|lvl)\s*(\d+)/i) ||
-                                   (node.className || '').toString().match(/level(\d+)/i);
+                        const attrs = [node.getAttribute('class') || '', node.getAttribute('title') || '', node.getAttribute('aria-label') || ''].join(' ');
+                        const lm = text.match(/(?:level|lvl)\s*(\d+)/i) || attrs.match(/level\s*(\d+)/i);
                         if (lm) { level = parseInt(lm[1],10); break; }
                     }
-                    if (!level) {
-                        const lm = (a.parentElement?.className || '').toString().match(/level(\d+)/i);
-                        if (lm) level = parseInt(lm[1],10);
-                    }
-                    const disabled = a.classList.contains('disabled') ||
-                        a.closest('.disabled') || a.getAttribute('aria-disabled') === 'true';
+                    const disabled = a.classList.contains('disabled') || !!a.closest('.disabled') || a.getAttribute('aria-disabled') === 'true' || a.getAttribute('data-disabled') === 'true';
                     fields.push({id:m[1], level, disabled:!!disabled, name:norm(a.getAttribute('title') || a.getAttribute('aria-label') || a.innerText || '')});
                 }
                 if (!fields.length) return JSON.stringify({state:'no_fields'});
@@ -1276,12 +1415,19 @@ class FarmAutomationService : Service() {
                     return /green/.test(cls) && /build|upgrade/.test(cls);
                 });
                 if (!btn) return 'not-found';
-                btn.scrollIntoView({block:'center'}); btn.click(); return 'clicked:' + (btn.innerText || btn.value || 'upgrade');
+                btn.scrollIntoView({block:'center'});
+                const href = btn.getAttribute('href') || '';
+                if (href && /build\.php/i.test(href)) {
+                    window.location.href = href;
+                    return 'navigated:' + href;
+                }
+                btn.click();
+                return 'clicked:' + (btn.innerText || btn.value || 'upgrade');
             })();
         """.trimIndent()
         automationWebView()?.evaluateJavascript(js) { raw ->
             val result = raw.orEmpty().trim('"').replace("\\\"", "\"")
-            if (result.startsWith("clicked")) {
+            if (result.startsWith("clicked") || result.startsWith("navigated")) {
                 pendingUpgradeUrl = ""
                 pendingUpgradeCosts = longArrayOf(0L, 0L, 0L, 0L)
                 logEvent("Resource Builder: upgrade berhasil diklik di ${builderVillages.getOrNull(builderVillageIndex)?.second ?: "village ${builderVillageIndex + 1}"}")
@@ -1305,21 +1451,51 @@ class FarmAutomationService : Service() {
 
     private fun finishResourceBuilderCycle() {
         debugTrace("ENTER finishResourceBuilderCycle")
-        val nowMs = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
         if (resourceBuilderCycleStartedAt > 0L) {
-            val builderDuration = (nowMs - resourceBuilderCycleStartedAt).coerceAtLeast(0L)
+            val duration = (now - resourceBuilderCycleStartedAt).coerceAtLeast(0L)
             getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                .putLong("resource_builder_cycle_duration_ms", builderDuration)
-                .putLong("resource_builder_cycle_started_at", 0L)
+                .putLong("resource_cycle_duration_ms", duration)
+                .putLong("resource_cycle_started_at", 0L)
                 .apply()
-            logEvent("Resource Builder: waktu proses ${formatDuration(builderDuration)}")
+            logEvent("Resource Builder: waktu proses ${formatDuration(duration)}")
             resourceBuilderCycleStartedAt = 0L
         }
         builderInProgress = false
         builderVillages.clear()
         builderVillageIndex = 0
+        pendingBuilderResourceHref = ""
+        builderVillageClickInProgress = false
         logEvent("Resource Builder: siklus selesai")
         scheduleNextRandomRun()
+        updateNotification("Next Run ${timeFormat.format(Date(nextAt))} | dalam ${formatDuration((nextAt - System.currentTimeMillis()).coerceAtLeast(0L))}")
+    }
+
+    private fun loadSavedBuilderResourceTargets(overridePrefs: android.content.SharedPreferences? = null) {
+        debugTrace("ENTER loadSavedBuilderResourceTargets")
+        val prefs = overridePrefs ?: getSharedPreferences(PREFS, MODE_PRIVATE)
+        builderResourceLinks.clear()
+        builderResourceLevels.clear()
+        val raw = prefs.getString("resource_builder_targets_json", "{}").orEmpty()
+        val obj = runCatching { JSONObject(raw) }.getOrNull() ?: return
+        for (key in obj.keys()) {
+            val item = obj.optJSONObject(key) ?: continue
+            val href = item.optString("href").trim()
+            if (href.isBlank()) continue
+            builderResourceLinks[key] = href
+            builderResourceLevels[key] = item.optInt("level", -1).takeIf { it >= 0 } ?: -1
+        }
+        logEvent("Resource Builder: ${builderResourceLinks.size} target resource tersimpan dimuat")
+    }
+
+    private fun absoluteBuilderHref(href: String): String {
+        val clean = href.trim()
+        if (clean.startsWith("http://", true) || clean.startsWith("https://", true)) return clean
+        return when {
+            clean.startsWith("/") -> server + clean
+            clean.startsWith("./") -> "$server/${clean.removePrefix("./")}"
+            else -> "$server/$clean"
+        }
     }
 
     private fun discoverVillagesForBuilder() {
@@ -1527,9 +1703,34 @@ class FarmAutomationService : Service() {
         processResourceBuilderVillage()
     }
 
+    private fun formatDuration(ms: Long): String {
+        val totalSeconds = (ms.coerceAtLeast(0L) / 1000L)
+        val hours = totalSeconds / 3600L
+        val minutes = (totalSeconds % 3600L) / 60L
+        val seconds = totalSeconds % 60L
+        return String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
+    }
+
+    private fun persistActiveCycleDuration(now: Long = System.currentTimeMillis()) {
+        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
+        val edit = prefs.edit()
+        if (farmListCycleStartedAt > 0L) {
+            edit.putLong("farm_cycle_duration_ms", (now - farmListCycleStartedAt).coerceAtLeast(0L))
+            edit.putLong("farm_cycle_started_at", 0L)
+            farmListCycleStartedAt = 0L
+        }
+        if (resourceBuilderCycleStartedAt > 0L) {
+            edit.putLong("resource_cycle_duration_ms", (now - resourceBuilderCycleStartedAt).coerceAtLeast(0L))
+            edit.putLong("resource_cycle_started_at", 0L)
+            resourceBuilderCycleStartedAt = 0L
+        }
+        edit.apply()
+    }
+
     private fun scheduleNextRandomRun() {
         debugTrace("ENTER scheduleNextRandomRun")
         if (!running) return
+        persistActiveCycleDuration()
         handler.removeCallbacks(cycleWatchdogRunnable)
         val chosenMinutes = if (maxMinutes <= minMinutes) minMinutes
         else Random.nextLong(minMinutes, maxMinutes + 1)
@@ -1539,9 +1740,8 @@ class FarmAutomationService : Service() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean("cycle_active", false).apply()
         handler.removeCallbacks(nextRunRunnable)
         handler.postDelayed(nextRunRunnable, delay)
-        val nextText = "Next Run ${timeFormat.format(Date(nextAt))} — dalam ${chosenMinutes} menit"
-        updateNotification(nextText)
-        logEvent("Interval berikutnya dipilih acak: $chosenMinutes menit; $nextText")
+        logEvent("Interval berikutnya dipilih acak: $chosenMinutes menit; Next Run=${timeFormat.format(Date(nextAt))}")
+        updateNotification("Next Run ${timeFormat.format(Date(nextAt))} | dalam ${formatDuration(delay)}")
     }
 
     private val nextRunRunnable = Runnable {
@@ -1665,6 +1865,7 @@ class FarmAutomationService : Service() {
 
     private fun stopAutomation() {
         debugTrace("ENTER stopAutomation")
+        persistActiveCycleDuration()
         running = false
         handler.removeCallbacks(cycleWatchdogRunnable)
         pendingStartAll = false
@@ -1683,14 +1884,6 @@ class FarmAutomationService : Service() {
         logEvent("Background service dihentikan")
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
-    }
-
-    private fun formatDuration(durationMs: Long): String {
-        val totalSeconds = (durationMs / 1000L).coerceAtLeast(0L)
-        val hours = totalSeconds / 3600L
-        val minutes = (totalSeconds % 3600L) / 60L
-        val seconds = totalSeconds % 60L
-        return String.format(Locale.getDefault(), "%02d:%02d:%02d", hours, minutes, seconds)
     }
 
     private fun updateNotification(text: String) {
