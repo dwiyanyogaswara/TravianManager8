@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.travianfarmassistant"
         minSdk = 26
         targetSdk = 35
-        versionCode = 38
-        versionName = "4.14.7"
+        versionCode = 39
+        versionName = "4.14.8"
     }
 
     compileOptions {
